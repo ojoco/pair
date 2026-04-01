@@ -1,0 +1,18 @@
+{
+  "name": "vanguard-md-pairing-site",
+  "version": "1.0.0",
+  "description": "VANGUARD MD Official Pairing Site - Mr.Admin Blue",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "@whiskeysockets/baileys": "7.0.0-rc.9",
+    "pino": "^9.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
