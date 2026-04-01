@@ -17,10 +17,10 @@ app.use(express.json())
 app.use(cors())
 app.use(express.static(path.join(__dirname, 'public')))
 
-const activeSessions = new Map() // sessionId → { sock, phone, sessionDir, sseClients }
+const activeSessions = new Map() // sessionId → { sock, phone, sessionDir }
 const sseClients = new Map()     // sessionId → array of SSE responses
 
-// ====================== SSE for real-time code ======================
+// ====================== SSE for real-time code & errors ======================
 app.get('/events', (req, res) => {
   const sessionId = req.query.sessionId
   if (!sessionId) return res.status(400).end()
@@ -76,7 +76,7 @@ app.post('/generate', async (req, res) => {
 
   activeSessions.set(sessionId, { sock, phone, sessionDir })
 
-  // ── Pairing code handler ──
+  // ── Pairing code handler (UPDATED with error handling) ──
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update
 
@@ -85,12 +85,18 @@ app.post('/generate', async (req, res) => {
         let code = await sock.requestPairingCode(phone)
         code = code?.match(/.{1,4}/g)?.join('-') || code
 
-        // Send to all SSE clients
+        // Send success code to frontend
         const clients = sseClients.get(sessionId) || []
         clients.forEach(client => {
           client.write(`data: ${JSON.stringify({ code })}\n\n`)
         })
-      } catch (err) {}
+      } catch (err) {
+        // Send error so frontend shows message instead of hanging
+        const clients = sseClients.get(sessionId) || []
+        clients.forEach(client => {
+          client.write(`data: ${JSON.stringify({ error: 'Invalid number or WhatsApp rejected the request.\nPlease check the number and try again.' })}\n\n`)
+        })
+      }
     }
 
     if (connection === 'open') {
@@ -124,17 +130,15 @@ app.post('/generate', async (req, res) => {
         sock.end()
         activeSessions.delete(sessionId)
         sseClients.delete(sessionId)
-        // Delete temp session folder
         try { fs.rmSync(sessionDir, { recursive: true, force: true }) } catch (_) {}
       }, 15000)
     }
 
-    // Your original reconnect magic (if WhatsApp kicks us)
+    // Reconnect magic (kept from your original index.js)
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode
       if (statusCode !== DisconnectReason.loggedOut && statusCode !== 401) {
         console.log(`♻️ Reconnecting session ${sessionId}...`)
-        // We let Baileys handle it automatically
       }
     }
   })
