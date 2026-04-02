@@ -1,6 +1,7 @@
 {
   "name": "vanguard-md-pairing-site",
   "version": "1.0.0",
+  "type": "commonjs",
   "description": "VANGUARD MD Official Pairing Site - Mr.Admin Blue",
   "main": "index.js",
   "scripts": {
@@ -16,3 +17,7 @@
     "node": ">=18"
   }
 }
+
+  
+    
+  
