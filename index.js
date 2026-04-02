@@ -2,6 +2,20 @@
 //  VANGUARD MD — Official Pairing Site (RENDER FIXED v2)
 //  Made with love by Mr.Admin Blue 2026 🔥
 // ================================================
+//install 
+
+// ── Auto-install guard (Render loves this) ─────────────
+;(() => {
+  const { execSync } = require('child_process')
+  const fs = require('fs')
+  const path = require('path')
+  if (!fs.existsSync(path.join(__dirname, 'node_modules'))) {
+    console.log('\x1b[36m[VANGUARD PAIRING]\x1b[0m Dependencies missing. Installing...')
+    execSync('npm install --legacy-peer-deps', { stdio: 'inherit' })
+    console.log('\x1b[32m[✅ DONE]\x1b[0m Packages installed!')
+  }
+})()
+
 
 const express = require('express')
 const cors = require('cors')
