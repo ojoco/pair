@@ -1,21 +1,7 @@
 // ================================================
-//  VANGUARD MD — Official Pairing Site (RENDER FIXED v2)
+//  VANGUARD MD — Pairing Site (RENDER FREE-TIER FIXED v3)
 //  Made with love by Mr.Admin Blue 2026 🔥
 // ================================================
-//install 
-
-// ── Auto-install guard (Render loves this) ─────────────
-;(() => {
-  const { execSync } = require('child_process')
-  const fs = require('fs')
-  const path = require('path')
-  if (!fs.existsSync(path.join(__dirname, 'node_modules'))) {
-    console.log('\x1b[36m[VANGUARD PAIRING]\x1b[0m Dependencies missing. Installing...')
-    execSync('npm install --legacy-peer-deps', { stdio: 'inherit' })
-    console.log('\x1b[32m[✅ DONE]\x1b[0m Packages installed!')
-  }
-})()
-
 
 const express = require('express')
 const cors = require('cors')
@@ -54,7 +40,7 @@ app.get('/events', (req, res) => {
   if (!sseClients.has(sessionId)) sseClients.set(sessionId, [])
   sseClients.get(sessionId).push(res)
 
-  const keepAlive = setInterval(() => res.write(': ping\n\n'), 25000)
+  const keepAlive = setInterval(() => res.write(': ping\n\n'), 20000)
 
   req.on('close', () => {
     clearInterval(keepAlive)
@@ -66,22 +52,19 @@ app.get('/events', (req, res) => {
   })
 })
 
-// ====================== FIXED + RENDER-PROOF GENERATE ======================
+// ====================== RENDER-FREE-TIER PROOF ======================
 app.post('/generate', async (req, res) => {
   const { phone } = req.body
-  if (!phone || phone.length < 9) {
-    return res.status(400).json({ error: 'Invalid phone number' })
-  }
+  if (!phone || phone.length < 9) return res.status(400).json({ error: 'Invalid phone number' })
 
   const sessionId = `pair-${Date.now()}`
   const sessionDir = path.join(__dirname, 'sessions', sessionId)
-
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
   const { version } = await fetchLatestBaileysVersion()
 
-  console.log(`[${sessionId}] 🚀 Creating socket for +${phone}`)
+  console.log(`[${sessionId}] 🚀 Starting socket for +${phone}`)
 
   const sock = makeWASocket({
     version,
@@ -90,97 +73,96 @@ app.post('/generate', async (req, res) => {
     auth: { creds: state.creds, keys: state.keys },
     browser: ['Ubuntu', 'Chrome', '20.0.04'],
     markOnlineOnConnect: false,
-    defaultQueryTimeoutMs: 90000,      // increased for Render
-    connectTimeoutMs: 90000,
-    keepAliveIntervalMs: 30000,        // helps on free tier
+    defaultQueryTimeoutMs: 120000,
+    connectTimeoutMs: 120000,
+    keepAliveIntervalMs: 30000,
   })
 
   activeSessions.set(sessionId, { sock, phone, sessionDir })
   pairingRequested.set(sessionId, false)
 
+  let codeSent = false
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update
+    console.log(`[${sessionId}] connection.update → ${connection || 'undefined'}`)
 
-    console.log(`[${sessionId}] connection.update → ${connection}`)
-
-    // 🔥 RENDER-FIXED pairing request
+    // ── Request pairing code once ──
     if (
       connection === 'connecting' &&
       !pairingRequested.get(sessionId) &&
       !state.creds.registered
     ) {
       pairingRequested.set(sessionId, true)
-      console.log(`[${sessionId}] ⏳ Waiting 6 seconds (Render is slow)...`)
-
-      await delay(6000)   // ← increased for Render free tier
+      console.log(`[${sessionId}] ⏳ Waiting 8 seconds (Render free tier is slow)...`)
+      await delay(8000)
 
       try {
         let code = await sock.requestPairingCode(phone)
         code = code?.match(/.{1,4}/g)?.join('-') || code
+        codeSent = true
 
         console.log(`[${sessionId}] ✅ Pairing code generated: ${code}`)
-
         const clients = sseClients.get(sessionId) || []
-        clients.forEach(client => {
-          client.write(`data: ${JSON.stringify({ code })}\n\n`)
-        })
+        clients.forEach(client => client.write(`data: ${JSON.stringify({ code })}\n\n`))
       } catch (err) {
         console.error(`[${sessionId}] ❌ requestPairingCode failed:`, err.message)
         const clients = sseClients.get(sessionId) || []
-        clients.forEach(client => {
-          client.write(`data: ${JSON.stringify({ 
-            error: 'WhatsApp rejected the request. Try a different number or wait 1 minute.' 
-          })}\n\n`)
-        })
+        clients.forEach(client => client.write(`data: ${JSON.stringify({ error: 'WhatsApp rejected request. Try again in 30 seconds.' })}\n\n`))
       }
     }
 
     if (connection === 'open') {
-      console.log(`[${sessionId}] ✅ Successfully paired for +${phone}`)
-      // ... (same creds.json sending code as before) ...
+      console.log(`[${sessionId}] 🎉 Successfully paired for +${phone}`)
+      // send creds.json (same as before)
       try {
         const credsPath = path.join(sessionDir, 'creds.json')
         if (fs.existsSync(credsPath)) {
           const buffer = fs.readFileSync(credsPath)
-          const jid = phone + '@s.whatsapp.net'
-          await sock.sendMessage(jid, {
+          await sock.sendMessage(phone + '@s.whatsapp.net', {
             document: buffer,
             mimetype: 'application/json',
             fileName: 'creds.json',
-            caption: `✅ *VANGUARD MD SESSION FILE*\n\nYour pairing was successful!\nSave this file...\n\nMade with love by Mr.Admin Blue 2026 🔥`
+            caption: `✅ *VANGUARD MD SESSION FILE*\n\nPairing successful!\nSave this file...\n\nMade with love by Mr.Admin Blue 2026 🔥`
           })
         }
-      } catch (e) { console.log('Failed to send creds:', e.message) }
-
-      setTimeout(() => cleanupSession(sessionId, sock), 15000)
+      } catch (e) {}
+      setTimeout(() => cleanupSession(sessionId, sock), 10000)
     }
 
     if (connection === 'close') {
       const status = lastDisconnect?.error?.output?.statusCode
-      console.log(`[${sessionId}] ❌ Connection closed. Status: ${status} | Reason:`, lastDisconnect?.error?.message || 'unknown')
-
-      // NO auto-reconnect on pairing site (we don't want infinite loops)
-      if (status !== DisconnectReason.loggedOut && status !== 401) {
-        console.log(`[${sessionId}] ♻️ Would have reconnected but skipping on pairing site`)
+      console.log(`[${sessionId}] ❌ Connection closed | Status: ${status}`)
+      if (!codeSent && status !== DisconnectReason.loggedOut) {
+        console.log(`[${sessionId}] 🔄 Still waiting for pairing... (will stay alive 4 minutes)`)
       }
     }
   })
 
   sock.ev.on('creds.update', saveCreds)
 
+  // 🔥 Keep session alive for 4 minutes even if no 'open' yet
+  setTimeout(() => {
+    if (!codeSent || !activeSessions.has(sessionId)) return
+    console.log(`[${sessionId}] ⏰ 4-minute timeout reached → cleaning up`)
+    cleanupSession(sessionId, sock)
+  }, 240000)
+
   res.json({ success: true, sessionId })
 })
 
 function cleanupSession(sessionId, sock) {
-  sock.end()
+  try { sock.end() } catch (_) {}
   activeSessions.delete(sessionId)
   sseClients.delete(sessionId)
   pairingRequested.delete(sessionId)
-  try { fs.rmSync(path.join(__dirname, 'sessions', sessionId), { recursive: true, force: true }) } catch (_) {}
+  try {
+    fs.rmSync(path.join(__dirname, 'sessions', sessionId), { recursive: true, force: true })
+  } catch (_) {}
 }
 
 // ====================== Start ======================
 app.listen(PORT, () => {
   console.log(`🚀 VANGUARD MD Pairing Site LIVE → http://localhost:${PORT}`)
-  console.log(`👑 Made by Mr.Admin Blue 2026 | Render-optimized`)
+  console.log(`👑 Free-tier optimized | Made by Mr.Admin Blue 2026`)
 })
