@@ -1,7 +1,7 @@
 // ================================================
-//  VANGUARD MD - Pairing Site (SESSION ID EDITION)
+//  VANGUARD MD - Pairing Site (SESSION ID EDITION v2)
+//  Fixed: Upload logic + userJid scope
 //  Made with love by Mr.Admin Blue 2026 🔥
-//  Now with Session ID Magic ✨
 // ================================================
 const express = require('express')
 const cors = require('cors')
@@ -46,7 +46,7 @@ function generateSessionId(shortcode) {
   return `VANGUARD-MD;;;${prefix}&${shortcode}&${suffix}`
 }
 
-// ====================== ZIP & UPLOAD ======================
+// ====================== ZIP & UPLOAD (FIXED) ======================
 async function zipAndUploadSession(sessionDir) {
   try {
     // Create zip of entire session folder
@@ -56,9 +56,16 @@ async function zipAndUploadSession(sessionDir) {
     const zipPath = path.join(__dirname, `vanguard_session_${Date.now()}.zip`)
     zip.writeZip(zipPath)
     
-    console.log(`[ZIP] Created: ${zipPath}`)
+    // Check file size (Uguu limit ~100MB usually)
+    const stats = fs.statSync(zipPath)
+    const fileSizeMB = stats.size / (1024 * 1024)
+    console.log(`[ZIP] Created: ${zipPath} (${fileSizeMB.toFixed(2)} MB)`)
     
-    // Upload to Uguu
+    if (fileSizeMB > 100) {
+      throw new Error(`Zip file too large: ${fileSizeMB.toFixed(2)}MB (max 100MB)`)
+    }
+    
+    // Upload to Uguu - EXACT same logic as working upload.js
     const form = new FormData()
     form.append('files[]', fs.createReadStream(zipPath))
     
@@ -67,30 +74,53 @@ async function zipAndUploadSession(sessionDir) {
       method: 'POST',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        ...form.getHeaders(),
+        ...form.getHeaders(), // This auto-sets Content-Type with boundary
       },
       data: form,
-      timeout: 30000,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 60000, // 60s timeout for large files
     })
     
     // Clean up local zip
     try { fs.unlinkSync(zipPath) } catch (_) {}
     
+    console.log('[UPLOAD] Uguu response:', JSON.stringify(data))
+    
+    // Extract URL - handle different response formats
+    let url = ''
+    if (typeof data === 'string') {
+      url = data
+    } else if (data.files && data.files[0]) {
+      url = typeof data.files[0] === 'string' ? data.files[0] : (data.files[0].url || data.files[0].url_full || '')
+    } else if (data.url) {
+      url = data.url
+    } else if (data[0] && data[0].url) {
+      url = data[0].url
+    }
+    
+    if (!url) {
+      throw new Error('No URL in upload response: ' + JSON.stringify(data))
+    }
+    
     // Extract shortcode from URL
-    // Uguu returns: https://n.uguu.se/vmdbjBHy.zip
-    const url = typeof data.files[0] === 'string' ? data.files[0] : data.files[0].url
-    const match = url.match(/\/([a-zA-Z0-9]+)\.zip$/)
+    // URL format: https://n.uguu.se/vmdbjBHy.zip or https://uguu.se/f/vmdbjBHy.zip
+    const match = url.match(/\/([a-zA-Z0-9]+)\.zip$/) || url.match(/\/f\/([a-zA-Z0-9]+)\.zip$/)
     const shortcode = match ? match[1] : null
     
     if (!shortcode) {
-      throw new Error('Could not extract shortcode from upload response')
+      throw new Error(`Could not extract shortcode from URL: ${url}`)
     }
     
-    console.log(`[UPLOAD] Shortcode: ${shortcode}`)
+    console.log(`[UPLOAD] Success! URL: ${url}, Shortcode: ${shortcode}`)
     return shortcode
     
   } catch (err) {
     console.error('[ZIP/UPLOAD ERROR]', err.message)
+    if (err.response) {
+      console.error('[ZIP/UPLOAD ERROR] Status:', err.response.status)
+      console.error('[ZIP/UPLOAD ERROR] Data:', err.response.data)
+    }
     throw err
   }
 }
@@ -140,6 +170,9 @@ async function startPairingSession(sessionId, phone, res) {
   
   console.log(`[${sessionId}] 🚀 Starting socket for +${phone}`)
   
+  // Define userJid EARLY so it's available everywhere in this function
+  const userJid = phone + '@s.whatsapp.net'
+  
   const sock = makeWASocket({
     version,
     logger: pino({ level: 'silent' }),
@@ -159,6 +192,7 @@ async function startPairingSession(sessionId, phone, res) {
   const session = {
     sock,
     phone,
+    userJid, // Store it in session object too
     sessionDir,
     pairingRequested: false,
     paired: false,
@@ -214,19 +248,17 @@ async function startPairingSession(sessionId, phone, res) {
         
         // 2. GENERATE Session ID
         const vanguardSessionId = generateSessionId(shortcode)
-        console.log(`[${sessionId}] 🔐 Session ID generated`)
+        console.log(`[${sessionId}] 🔐 Session ID generated: ${vanguardSessionId.substring(0, 50)}...`)
         
         // 3. SEND TO USER'S WHATSAPP - First: Raw Session ID (for easy copying)
-        const userJid = phone + '@s.whatsapp.net'
-        
-        // Message 1: Raw Session ID (easy copy)
-        await sock.sendMessage(userJid, {
+        // Use session.userJid which is guaranteed to be defined
+        await sock.sendMessage(session.userJid, {
           text: vanguardSessionId
         })
-        console.log(`[${sessionId}] 📤 Raw Session ID sent`)
+        console.log(`[${sessionId}] 📤 Raw Session ID sent to ${session.userJid}`)
         
         // Message 2: Fancy formatted message
-        await sock.sendMessage(userJid, {
+        await sock.sendMessage(session.userJid, {
           text:
             '╭───────────────━⊷\n' +
             '┃ 🔐 *VANGUARD MD SESSION*\n' +
@@ -264,19 +296,28 @@ async function startPairingSession(sessionId, phone, res) {
       } catch (err) {
         console.error(`[${sessionId}] ❌ Session processing failed: ${err.message}`)
         sendToClients(sessionId, { 
-          error: 'Session created but failed to upload. Please contact support.' 
+          error: 'Session created but upload failed. Sending manual file...' 
         })
         
-        // Fallback: Send creds.json only
+        // Fallback: Send creds.json only - NOW userJid is accessible!
         try {
           const credsPath = path.join(sessionDir, 'creds.json')
           if (fs.existsSync(credsPath)) {
             const buffer = fs.readFileSync(credsPath)
-            await sock.sendMessage(userJid, {
+            await sock.sendMessage(session.userJid, {
               document: buffer,
               mimetype: 'application/json',
               fileName: 'creds.json',
-              caption: '⚠️ Fallback: Manual session file\nUpload this to /session folder'
+              caption: 
+                '⚠️ *Upload Failed - Manual Session*\n\n' +
+                'Save this creds.json to your bot /session folder.\n' +
+                'Error: ' + err.message + '\n\n' +
+                '> Made With Love By Admin Blue'
+            })
+            console.log(`[${sessionId}] 📤 Fallback creds.json sent`)
+          } else {
+            await sock.sendMessage(session.userJid, {
+              text: '❌ Critical error: Session files not found. Please pair again.'
             })
           }
         } catch (fallbackErr) {
@@ -285,7 +326,7 @@ async function startPairingSession(sessionId, phone, res) {
       }
       
       // Cleanup after sending
-      session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), 10000)
+      session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), 15000)
     }
     
     if (connection === 'close') {
@@ -375,6 +416,6 @@ function cleanupSession(sessionId) {
 // ====================== START ======================
 app.listen(PORT, () => {
   console.log(`🚀 VANGUARD MD Pairing Site LIVE -> http://localhost:${PORT}`)
-  console.log(`👑 Session ID Edition | Made by Mr.Admin Blue 2026`)
-  console.log(`📦 Features: Auto-zip, Uguu upload, Guarded Session IDs`)
+  console.log(`👑 Session ID Edition v2 | Made by Mr.Admin Blue 2026`)
+  console.log(`📦 Fixed: Upload logic + userJid scope`)
 })
