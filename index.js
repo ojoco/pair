@@ -1,15 +1,13 @@
 // ================================================
-//  VANGUARD MD - Pairing Site (CREDS.JSON EDITION v3)
-//  Fixed: Uploads creds.json only (no zip)
-//  Sends: 1) Generating... 2) Session ID 3) Image+caption
+//  VANGUARD MD - Pairing Site (OBFUSCATED BASE64 v5)
+//  Session ID = Base64(creds.json) with junk injection
+//  Junk chars every 50 chars to obfuscate
 //  Made with love by Mr.Admin Blue 2026 🔥
 // ================================================
 const express = require('express')
 const cors = require('cors')
 const path = require('path')
 const fs = require('fs')
-const axios = require('axios')
-const FormData = require('form-data')
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -30,95 +28,13 @@ app.use(express.static(path.join(__dirname, 'public')))
 const activeSessions = new Map()
 const sseClients = new Map()
 
-// Path to your bot image (place botimage.jpg in assets folder)
+// Path to your bot image
 const BOT_IMAGE_PATH = path.join(__dirname, 'assets', 'botimage.jpg')
 
-// ====================== RANDOM STRING GEN ======================
-function generateRandomString(length) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-  let result = ''
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length))
-  }
-  return result
-}
-
-function generateSessionId(shortcode) {
-  const prefix = generateRandomString(100)
-  const suffix = generateRandomString(100)
-  return `VANGUARD-MD;;;${prefix}&${shortcode}&${suffix}`
-}
-
-// ====================== UPLOAD CREDS.JSON ONLY ======================
-async function uploadCredsJson(credsPath) {
-  try {
-    if (!fs.existsSync(credsPath)) {
-      throw new Error('creds.json not found at: ' + credsPath)
-    }
-    
-    const stats = fs.statSync(credsPath)
-    const fileSizeKB = stats.size / 1024
-    console.log(`[UPLOAD] creds.json size: ${fileSizeKB.toFixed(2)} KB`)
-    
-    // Upload to Uguu - EXACT same logic as working upload.js
-    const form = new FormData()
-    form.append('files[]', fs.createReadStream(credsPath))
-    
-    const { data } = await axios({
-      url: 'https://uguu.se/upload.php',
-      method: 'POST',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        ...form.getHeaders(),
-      },
-      data: form,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      timeout: 60000,
-    })
-    
-    console.log('[UPLOAD] Uguu response:', JSON.stringify(data))
-    
-    // Extract URL - handle different response formats
-    let url = ''
-    if (typeof data === 'string') {
-      url = data
-    } else if (data.files && data.files[0]) {
-      url = typeof data.files[0] === 'string' ? data.files[0] : (data.files[0].url || data.files[0].url_full || '')
-    } else if (data.url) {
-      url = data.url
-    } else if (data[0] && data[0].url) {
-      url = data[0].url
-    }
-    
-    if (!url) {
-      throw new Error('No URL in upload response: ' + JSON.stringify(data))
-    }
-    
-    // Extract shortcode from URL
-    // URL format: https://n.uguu.se/vmdbjBHy.json or https://uguu.se/f/vmdbjBHy.json
-    const match = url.match(/\/([a-zA-Z0-9]+)\.json$/) || 
-                  url.match(/\/f\/([a-zA-Z0-9]+)\.json$/) ||
-                  url.match(/\/([a-zA-Z0-9]+)$/) ||  // No extension case
-                  url.match(/\/f\/([a-zA-Z0-9]+)$/)
-    const shortcode = match ? match[1] : null
-    
-    if (!shortcode) {
-      throw new Error(`Could not extract shortcode from URL: ${url}`)
-    }
-    
-    console.log(`[UPLOAD] Success! URL: ${url}, Shortcode: ${shortcode}`)
-    return shortcode
-    
-  } catch (err) {
-    console.error('[UPLOAD ERROR]', err.message)
-    if (err.response) {
-      console.error('[UPLOAD ERROR] Status:', err.response.status)
-      console.error('[UPLOAD ERROR] Data:', err.response.data)
-    }
-    throw err
-  }
-}
+// Configuration
+const JUNK_CHARS = '#*~!@$%^&(){}[]|\\:;"\'<>,.?/'  // All non-Base64 chars
+const JUNK_INTERVAL = 50  // Inject junk every 50 chars
+const GUARD_CHAR = '*'    // Delimiter (not in junk pool to avoid confusion)
 
 // ====================== SSE ======================
 app.get('/events', (req, res) => {
@@ -155,6 +71,60 @@ function sendToClients(sessionId, data) {
   })
 }
 
+// ====================== RANDOM STRING GEN ======================
+function generateRandomString(length) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  let result = ''
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length))
+  }
+  return result
+}
+
+// ====================== JUNK INJECTION ======================
+function injectJunk(base64String) {
+  let result = ''
+  let junkIndex = 0
+  
+  for (let i = 0; i < base64String.length; i++) {
+    result += base64String[i]
+    
+    // Inject junk every JUNK_INTERVAL chars (except at the very end)
+    if ((i + 1) % JUNK_INTERVAL === 0 && i !== base64String.length - 1) {
+      result += JUNK_CHARS[junkIndex % JUNK_CHARS.length]
+      junkIndex++
+    }
+  }
+  
+  return result
+}
+
+// ====================== CREATE SESSION ID ======================
+function createObfuscatedSessionId(credsPath) {
+  try {
+    if (!fs.existsSync(credsPath)) {
+      throw new Error('creds.json not found')
+    }
+    
+    // Read creds.json
+    const credsData = fs.readFileSync(credsPath)
+    
+    // Base64 encode
+    const base64Creds = credsData.toString('base64')
+    
+    // Inject junk every 50 chars
+    const obfuscated = injectJunk(base64Creds)
+    
+    // Add guards: VANGUARD-MD;;;[100 rand]*[obfuscated]*[100 rand]
+    const prefix = generateRandomString(100)
+    const suffix = generateRandomString(100)
+    
+    return `VANGUARD-MD;;;${prefix}${GUARD_CHAR}${obfuscated}${GUARD_CHAR}${suffix}`
+  } catch (err) {
+    throw new Error('Failed to create session ID: ' + err.message)
+  }
+}
+
 // ====================== CORE PAIRING FUNCTION ======================
 async function startPairingSession(sessionId, phone, res) {
   const sessionDir = path.join(__dirname, 'sessions', sessionId)
@@ -165,7 +135,6 @@ async function startPairingSession(sessionId, phone, res) {
   
   console.log(`[${sessionId}] 🚀 Starting socket for +${phone}`)
   
-  // Define userJid EARLY
   const userJid = phone + '@s.whatsapp.net'
   
   const sock = makeWASocket({
@@ -239,34 +208,30 @@ async function startPairingSession(sessionId, phone, res) {
       try {
         const credsPath = path.join(sessionDir, 'creds.json')
         
-        // Verify creds.json exists
         if (!fs.existsSync(credsPath)) {
           throw new Error('creds.json not found after waiting')
         }
         
-        // 1. UPLOAD creds.json only
-        console.log(`[${sessionId}] 📤 Uploading creds.json...`)
-        const shortcode = await uploadCredsJson(credsPath)
+        // 1. CREATE OBFUSCATED SESSION ID
+        console.log(`[${sessionId}] 🔐 Creating obfuscated Session ID...`)
+        const vanguardSessionId = createObfuscatedSessionId(credsPath)
+        console.log(`[${sessionId}] ✅ Session ID created (${vanguardSessionId.length} chars)`)
         
-        // 2. GENERATE Session ID
-        const vanguardSessionId = generateSessionId(shortcode)
-        console.log(`[${sessionId}] 🔐 Session ID generated`)
-        
-        // 3. SEND 3 MESSAGES TO USER'S WHATSAPP
+        // 2. SEND 3 MESSAGES TO USER'S WHATSAPP
         
         // Message 1: "Generating Session ID..."
         await sock.sendMessage(session.userJid, {
           text: '⏳ *Generating Session ID...*'
         })
-        console.log(`[${sessionId}] 📤 Message 1 sent: Generating...`)
+        console.log(`[${sessionId}] 📤 Message 1 sent`)
         
-        // Message 2: Raw Session ID (easy copy)
+        // Message 2: Raw Session ID (single message, manageable size)
         await sock.sendMessage(session.userJid, {
           text: vanguardSessionId
         })
         console.log(`[${sessionId}] 📤 Message 2 sent: Session ID`)
         
-        // Message 3: Image with fancy caption (if image exists)
+        // Message 3: Image with fancy caption
         const caption = 
           '╭───────────────━⊷\n' +
           '┃ 🔐 *VANGUARD MD SESSION*\n' +
@@ -275,15 +240,14 @@ async function startPairingSession(sessionId, phone, res) {
           '┃ ✅ *Pairing Successful!*\n' +
           '┃\n' +
           '┃ 📋 *Your Session ID above*\n' +
-          '┃    Copy it exactly as shown\n' +
+          '┃    Copy the ENTIRE message\n' +
           '┃\n' +
           '┃ 🚀 *Deploy instantly:*\n' +
           '┃    Paste in your .env file:\n' +
           '┃    SESSION_ID=your_id_here\n' +
           '┃\n' +
-          '┃ ⚡ *IMPORTANT:*\n' +
-          '┃    Deploy within 48 hours!\n' +
-          '┃    Creds.json expires fast\n' +
+          '┃ 💾 *Self-contained session*\n' +
+          '┃    No expiry - No cloud needed!\n' +
           '┃\n' +
           '┃ 💡 *Need help?*\n' +
           '┃    https://whatsapp.com/channel/0029Vb6RoNb0bIdgZPwcst2Y\n' +
@@ -299,16 +263,15 @@ async function startPairingSession(sessionId, phone, res) {
           })
           console.log(`[${sessionId}] 📤 Message 3 sent: Image + caption`)
         } else {
-          // Fallback: send text only if image not found
           await sock.sendMessage(session.userJid, { text: caption })
-          console.log(`[${sessionId}] 📤 Message 3 sent: Text only (image not found)`)
+          console.log(`[${sessionId}] 📤 Message 3 sent: Text only`)
         }
         
-        // 4. Notify frontend
+        // 3. Notify frontend
         sendToClients(sessionId, { 
           status: 'done', 
           message: 'Session ID sent to your WhatsApp! Check your DMs.',
-          sessionId: vanguardSessionId 
+          sessionIdLength: vanguardSessionId.length
         })
         
         session.sessionIdSent = true
@@ -316,10 +279,10 @@ async function startPairingSession(sessionId, phone, res) {
       } catch (err) {
         console.error(`[${sessionId}] ❌ Session processing failed: ${err.message}`)
         sendToClients(sessionId, { 
-          error: 'Session created but upload failed. Sending manual file...' 
+          error: 'Session created but packaging failed. Sending manual file...' 
         })
         
-        // Fallback: Send creds.json directly as document
+        // Fallback: Send creds.json directly
         try {
           const credsPath = path.join(sessionDir, 'creds.json')
           if (fs.existsSync(credsPath)) {
@@ -329,18 +292,15 @@ async function startPairingSession(sessionId, phone, res) {
               mimetype: 'application/json',
               fileName: 'creds.json',
               caption: 
-                '⚠️ *Upload Failed - Manual Session*\n\n' +
-                'Save this creds.json to your bot /session folder.\n' +
+                '⚠️ *Fallback Mode*\n\n' +
+                'Save this to /session folder manually.\n' +
                 'Error: ' + err.message + '\n\n' +
                 '> Made With Love By Admin Blue'
             })
-            console.log(`[${sessionId}] 📤 Fallback: creds.json sent as document`)
+            console.log(`[${sessionId}] 📤 Fallback: creds.json sent`)
           }
         } catch (fallbackErr) {
           console.error(`[${sessionId}] ❌ Fallback failed: ${fallbackErr.message}`)
-          await sock.sendMessage(session.userJid, {
-            text: '❌ Critical error: ' + err.message + '\nPlease try pairing again.'
-          })
         }
       }
       
@@ -421,7 +381,7 @@ app.post('/generate', async (req, res) => {
 function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId)
   if (session) {
-    if (session.cleanupTimer) clearTimeout(session.session.cleanupTimer)
+    if (session.cleanupTimer) clearTimeout(session.cleanupTimer)
     try { session.sock.end() } catch (_) {}
     try {
       fs.rmSync(session.sessionDir, { recursive: true, force: true })
@@ -435,8 +395,7 @@ function cleanupSession(sessionId) {
 // ====================== START ======================
 app.listen(PORT, () => {
   console.log(`🚀 VANGUARD MD Pairing Site LIVE -> http://localhost:${PORT}`)
-  console.log(`👑 Creds.json Edition v3 | Made by Mr.Admin Blue 2026`)
-  console.log(`📤 Uploads: creds.json only (no zip)`)
-  console.log(`📸 Image path: ${BOT_IMAGE_PATH}`)
-  console.log(`   (Place botimage.jpg in assets/ folder)`)
+  console.log(`👑 Obfuscated Base64 v5 | Made by Mr.Admin Blue 2026`)
+  console.log(`🔐 Junk injection every ${JUNK_INTERVAL} chars`)
+  console.log(`💾 Self-contained creds.json (no cloud)`)
 })
