@@ -1,6 +1,7 @@
 // ================================================
-//  VANGUARD MD - Pairing Site (SESSION ID EDITION v2)
-//  Fixed: Upload logic + userJid scope
+//  VANGUARD MD - Pairing Site (CREDS.JSON EDITION v3)
+//  Fixed: Uploads creds.json only (no zip)
+//  Sends: 1) Generating... 2) Session ID 3) Image+caption
 //  Made with love by Mr.Admin Blue 2026 🔥
 // ================================================
 const express = require('express')
@@ -9,7 +10,6 @@ const path = require('path')
 const fs = require('fs')
 const axios = require('axios')
 const FormData = require('form-data')
-const AdmZip = require('adm-zip')
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -30,6 +30,9 @@ app.use(express.static(path.join(__dirname, 'public')))
 const activeSessions = new Map()
 const sseClients = new Map()
 
+// Path to your bot image (place botimage.jpg in assets folder)
+const BOT_IMAGE_PATH = path.join(__dirname, 'assets', 'botimage.jpg')
+
 // ====================== RANDOM STRING GEN ======================
 function generateRandomString(length) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
@@ -46,44 +49,33 @@ function generateSessionId(shortcode) {
   return `VANGUARD-MD;;;${prefix}&${shortcode}&${suffix}`
 }
 
-// ====================== ZIP & UPLOAD (FIXED) ======================
-async function zipAndUploadSession(sessionDir) {
+// ====================== UPLOAD CREDS.JSON ONLY ======================
+async function uploadCredsJson(credsPath) {
   try {
-    // Create zip of entire session folder
-    const zip = new AdmZip()
-    zip.addLocalFolder(sessionDir)
-    
-    const zipPath = path.join(__dirname, `vanguard_session_${Date.now()}.zip`)
-    zip.writeZip(zipPath)
-    
-    // Check file size (Uguu limit ~100MB usually)
-    const stats = fs.statSync(zipPath)
-    const fileSizeMB = stats.size / (1024 * 1024)
-    console.log(`[ZIP] Created: ${zipPath} (${fileSizeMB.toFixed(2)} MB)`)
-    
-    if (fileSizeMB > 100) {
-      throw new Error(`Zip file too large: ${fileSizeMB.toFixed(2)}MB (max 100MB)`)
+    if (!fs.existsSync(credsPath)) {
+      throw new Error('creds.json not found at: ' + credsPath)
     }
+    
+    const stats = fs.statSync(credsPath)
+    const fileSizeKB = stats.size / 1024
+    console.log(`[UPLOAD] creds.json size: ${fileSizeKB.toFixed(2)} KB`)
     
     // Upload to Uguu - EXACT same logic as working upload.js
     const form = new FormData()
-    form.append('files[]', fs.createReadStream(zipPath))
+    form.append('files[]', fs.createReadStream(credsPath))
     
     const { data } = await axios({
       url: 'https://uguu.se/upload.php',
       method: 'POST',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        ...form.getHeaders(), // This auto-sets Content-Type with boundary
+        ...form.getHeaders(),
       },
       data: form,
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
-      timeout: 60000, // 60s timeout for large files
+      timeout: 60000,
     })
-    
-    // Clean up local zip
-    try { fs.unlinkSync(zipPath) } catch (_) {}
     
     console.log('[UPLOAD] Uguu response:', JSON.stringify(data))
     
@@ -104,8 +96,11 @@ async function zipAndUploadSession(sessionDir) {
     }
     
     // Extract shortcode from URL
-    // URL format: https://n.uguu.se/vmdbjBHy.zip or https://uguu.se/f/vmdbjBHy.zip
-    const match = url.match(/\/([a-zA-Z0-9]+)\.zip$/) || url.match(/\/f\/([a-zA-Z0-9]+)\.zip$/)
+    // URL format: https://n.uguu.se/vmdbjBHy.json or https://uguu.se/f/vmdbjBHy.json
+    const match = url.match(/\/([a-zA-Z0-9]+)\.json$/) || 
+                  url.match(/\/f\/([a-zA-Z0-9]+)\.json$/) ||
+                  url.match(/\/([a-zA-Z0-9]+)$/) ||  // No extension case
+                  url.match(/\/f\/([a-zA-Z0-9]+)$/)
     const shortcode = match ? match[1] : null
     
     if (!shortcode) {
@@ -116,10 +111,10 @@ async function zipAndUploadSession(sessionDir) {
     return shortcode
     
   } catch (err) {
-    console.error('[ZIP/UPLOAD ERROR]', err.message)
+    console.error('[UPLOAD ERROR]', err.message)
     if (err.response) {
-      console.error('[ZIP/UPLOAD ERROR] Status:', err.response.status)
-      console.error('[ZIP/UPLOAD ERROR] Data:', err.response.data)
+      console.error('[UPLOAD ERROR] Status:', err.response.status)
+      console.error('[UPLOAD ERROR] Data:', err.response.data)
     }
     throw err
   }
@@ -170,7 +165,7 @@ async function startPairingSession(sessionId, phone, res) {
   
   console.log(`[${sessionId}] 🚀 Starting socket for +${phone}`)
   
-  // Define userJid EARLY so it's available everywhere in this function
+  // Define userJid EARLY
   const userJid = phone + '@s.whatsapp.net'
   
   const sock = makeWASocket({
@@ -192,7 +187,7 @@ async function startPairingSession(sessionId, phone, res) {
   const session = {
     sock,
     phone,
-    userJid, // Store it in session object too
+    userJid,
     sessionDir,
     pairingRequested: false,
     paired: false,
@@ -235,60 +230,85 @@ async function startPairingSession(sessionId, phone, res) {
       session.paired = true
       session.reconnectAttempts = 0
       console.log(`[${sessionId}] 🎉 Successfully paired for +${phone}`)
-      sendToClients(sessionId, { status: 'paired', message: 'Pairing successful! Creating session package...' })
+      sendToClients(sessionId, { status: 'paired', message: 'Pairing successful! Generating Session ID...' })
       
-      // ⏳ STAY ALIVE to capture all session files
-      console.log(`[${sessionId}] ⏳ Waiting 12 seconds to capture full session...`)
-      await delay(12000)
+      // ⏳ WAIT for creds.json to be written
+      console.log(`[${sessionId}] ⏳ Waiting 8 seconds for creds.json...`)
+      await delay(8000)
       
       try {
-        // 1. ZIP & UPLOAD session folder
-        console.log(`[${sessionId}] 📦 Zipping session files...`)
-        const shortcode = await zipAndUploadSession(sessionDir)
+        const credsPath = path.join(sessionDir, 'creds.json')
+        
+        // Verify creds.json exists
+        if (!fs.existsSync(credsPath)) {
+          throw new Error('creds.json not found after waiting')
+        }
+        
+        // 1. UPLOAD creds.json only
+        console.log(`[${sessionId}] 📤 Uploading creds.json...`)
+        const shortcode = await uploadCredsJson(credsPath)
         
         // 2. GENERATE Session ID
         const vanguardSessionId = generateSessionId(shortcode)
-        console.log(`[${sessionId}] 🔐 Session ID generated: ${vanguardSessionId.substring(0, 50)}...`)
+        console.log(`[${sessionId}] 🔐 Session ID generated`)
         
-        // 3. SEND TO USER'S WHATSAPP - First: Raw Session ID (for easy copying)
-        // Use session.userJid which is guaranteed to be defined
+        // 3. SEND 3 MESSAGES TO USER'S WHATSAPP
+        
+        // Message 1: "Generating Session ID..."
+        await sock.sendMessage(session.userJid, {
+          text: '⏳ *Generating Session ID...*'
+        })
+        console.log(`[${sessionId}] 📤 Message 1 sent: Generating...`)
+        
+        // Message 2: Raw Session ID (easy copy)
         await sock.sendMessage(session.userJid, {
           text: vanguardSessionId
         })
-        console.log(`[${sessionId}] 📤 Raw Session ID sent to ${session.userJid}`)
+        console.log(`[${sessionId}] 📤 Message 2 sent: Session ID`)
         
-        // Message 2: Fancy formatted message
-        await sock.sendMessage(session.userJid, {
-          text:
-            '╭───────────────━⊷\n' +
-            '┃ 🔐 *VANGUARD MD SESSION*\n' +
-            '╰───────────────━⊷\n' +
-            '╭───────────────━⊷\n' +
-            '┃ ✅ *Pairing Successful!*\n' +
-            '┃\n' +
-            '┃ 📋 *Your Session ID above*\n' +
-            '┃    Copy it exactly as shown\n' +
-            '┃\n' +
-            '┃ 🚀 *Deploy instantly:*\n' +
-            '┃    Paste in your .env file:\n' +
-            '┃    SESSION_ID=your_id_here\n' +
-            '┃\n' +
-            '┃ ⏰ *Expires in 48 hours*\n' +
-            '┃    Deploy immediately!\n' +
-            '┃\n' +
-            '┃ 💡 *Need help?*\n' +
-            '┃    Join: https://whatsapp.com/channel/0029Vb6RoNb0bIdgZPwcst2Y\n' +
-            '╰───────────────━⊷\n' +
-            '> *_Made With Love By Admin Blue_*\n' +
-            '> *_VANGUARD MD is on Fire 🔥_*'
-        })
-        console.log(`[${sessionId}] 📤 Fancy message sent`)
+        // Message 3: Image with fancy caption (if image exists)
+        const caption = 
+          '╭───────────────━⊷\n' +
+          '┃ 🔐 *VANGUARD MD SESSION*\n' +
+          '╰───────────────━⊷\n' +
+          '╭───────────────━⊷\n' +
+          '┃ ✅ *Pairing Successful!*\n' +
+          '┃\n' +
+          '┃ 📋 *Your Session ID above*\n' +
+          '┃    Copy it exactly as shown\n' +
+          '┃\n' +
+          '┃ 🚀 *Deploy instantly:*\n' +
+          '┃    Paste in your .env file:\n' +
+          '┃    SESSION_ID=your_id_here\n' +
+          '┃\n' +
+          '┃ ⚡ *IMPORTANT:*\n' +
+          '┃    Deploy within 48 hours!\n' +
+          '┃    Creds.json expires fast\n' +
+          '┃\n' +
+          '┃ 💡 *Need help?*\n' +
+          '┃    https://whatsapp.com/channel/0029Vb6RoNb0bIdgZPwcst2Y\n' +
+          '╰───────────────━⊷\n' +
+          '> *_Made With Love By Admin Blue_*\n' +
+          '> *_VANGUARD MD is on Fire 🔥_*'
+        
+        if (fs.existsSync(BOT_IMAGE_PATH)) {
+          const imageBuffer = fs.readFileSync(BOT_IMAGE_PATH)
+          await sock.sendMessage(session.userJid, {
+            image: imageBuffer,
+            caption: caption
+          })
+          console.log(`[${sessionId}] 📤 Message 3 sent: Image + caption`)
+        } else {
+          // Fallback: send text only if image not found
+          await sock.sendMessage(session.userJid, { text: caption })
+          console.log(`[${sessionId}] 📤 Message 3 sent: Text only (image not found)`)
+        }
         
         // 4. Notify frontend
         sendToClients(sessionId, { 
           status: 'done', 
-          message: 'Session ID sent to your WhatsApp!',
-          sessionId: vanguardSessionId // Optional: send to frontend too
+          message: 'Session ID sent to your WhatsApp! Check your DMs.',
+          sessionId: vanguardSessionId 
         })
         
         session.sessionIdSent = true
@@ -299,7 +319,7 @@ async function startPairingSession(sessionId, phone, res) {
           error: 'Session created but upload failed. Sending manual file...' 
         })
         
-        // Fallback: Send creds.json only - NOW userJid is accessible!
+        // Fallback: Send creds.json directly as document
         try {
           const credsPath = path.join(sessionDir, 'creds.json')
           if (fs.existsSync(credsPath)) {
@@ -314,14 +334,13 @@ async function startPairingSession(sessionId, phone, res) {
                 'Error: ' + err.message + '\n\n' +
                 '> Made With Love By Admin Blue'
             })
-            console.log(`[${sessionId}] 📤 Fallback creds.json sent`)
-          } else {
-            await sock.sendMessage(session.userJid, {
-              text: '❌ Critical error: Session files not found. Please pair again.'
-            })
+            console.log(`[${sessionId}] 📤 Fallback: creds.json sent as document`)
           }
         } catch (fallbackErr) {
           console.error(`[${sessionId}] ❌ Fallback failed: ${fallbackErr.message}`)
+          await sock.sendMessage(session.userJid, {
+            text: '❌ Critical error: ' + err.message + '\nPlease try pairing again.'
+          })
         }
       }
       
@@ -402,7 +421,7 @@ app.post('/generate', async (req, res) => {
 function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId)
   if (session) {
-    if (session.cleanupTimer) clearTimeout(session.cleanupTimer)
+    if (session.cleanupTimer) clearTimeout(session.session.cleanupTimer)
     try { session.sock.end() } catch (_) {}
     try {
       fs.rmSync(session.sessionDir, { recursive: true, force: true })
@@ -416,6 +435,8 @@ function cleanupSession(sessionId) {
 // ====================== START ======================
 app.listen(PORT, () => {
   console.log(`🚀 VANGUARD MD Pairing Site LIVE -> http://localhost:${PORT}`)
-  console.log(`👑 Session ID Edition v2 | Made by Mr.Admin Blue 2026`)
-  console.log(`📦 Fixed: Upload logic + userJid scope`)
+  console.log(`👑 Creds.json Edition v3 | Made by Mr.Admin Blue 2026`)
+  console.log(`📤 Uploads: creds.json only (no zip)`)
+  console.log(`📸 Image path: ${BOT_IMAGE_PATH}`)
+  console.log(`   (Place botimage.jpg in assets/ folder)`)
 })
