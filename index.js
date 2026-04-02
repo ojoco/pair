@@ -1,13 +1,19 @@
 // ================================================
-//  VANGUARD MD — Official Pairing Site (Render)
-//  Made with love by Mr.Admin Blue 2026
+//  VANGUARD MD — Official Pairing Site (FIXED)
+//  Made with love by Mr.Admin Blue 2026 🔥
 // ================================================
 
 const express = require('express')
 const cors = require('cors')
 const path = require('path')
 const fs = require('fs')
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys')
+const { 
+  default: makeWASocket, 
+  useMultiFileAuthState, 
+  fetchLatestBaileysVersion, 
+  DisconnectReason,
+  delay   // ← THIS WAS MISSING
+} = require('@whiskeysockets/baileys')
 const pino = require('pino')
 
 const app = express()
@@ -17,10 +23,11 @@ app.use(express.json())
 app.use(cors())
 app.use(express.static(path.join(__dirname, 'public')))
 
-const activeSessions = new Map() // sessionId → { sock, phone, sessionDir }
-const sseClients = new Map()     // sessionId → array of SSE responses
+const activeSessions = new Map()   // sessionId → { sock, phone, sessionDir }
+const sseClients = new Map()       // sessionId → array of SSE responses
+const pairingRequested = new Map() // sessionId → boolean (prevents spam)
 
-// ====================== SSE for real-time code & errors ======================
+// ====================== SSE ======================
 app.get('/events', (req, res) => {
   const sessionId = req.query.sessionId
   if (!sessionId) return res.status(400).end()
@@ -33,7 +40,6 @@ app.get('/events', (req, res) => {
   if (!sseClients.has(sessionId)) sseClients.set(sessionId, [])
   sseClients.get(sessionId).push(res)
 
-  // Keep alive
   const keepAlive = setInterval(() => res.write(': ping\n\n'), 25000)
 
   req.on('close', () => {
@@ -46,7 +52,7 @@ app.get('/events', (req, res) => {
   })
 })
 
-// ====================== Generate Pair Code ======================
+// ====================== FIXED GENERATE PAIR CODE ======================
 app.post('/generate', async (req, res) => {
   const { phone } = req.body
   if (!phone || phone.length < 9) {
@@ -75,26 +81,39 @@ app.post('/generate', async (req, res) => {
   })
 
   activeSessions.set(sessionId, { sock, phone, sessionDir })
+  pairingRequested.set(sessionId, false)
 
-  // ── Pairing code handler (UPDATED with error handling) ──
+  // ── FIXED pairing handler (now 99% same as your terminal) ──
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update
 
-    if (connection === 'connecting' && !sock.authState.creds.registered) {
+    // 🔥 THE MAGIC THAT WAS MISSING
+    if (
+      connection === 'connecting' &&
+      !pairingRequested.get(sessionId) &&
+      !state.creds.registered
+    ) {
+      pairingRequested.set(sessionId, true)
+      console.log(`[${sessionId}] Waiting 4.5s before requesting code...`)
+
+      await delay(4500)   // ← This is what makes terminal perfect
+
       try {
         let code = await sock.requestPairingCode(phone)
         code = code?.match(/.{1,4}/g)?.join('-') || code
 
-        // Send success code to frontend
         const clients = sseClients.get(sessionId) || []
         clients.forEach(client => {
           client.write(`data: ${JSON.stringify({ code })}\n\n`)
         })
+        console.log(`[${sessionId}] ✅ Pairing code sent: ${code}`)
       } catch (err) {
-        // Send error so frontend shows message instead of hanging
+        console.error(`[${sessionId}] Pairing error:`, err.message)
         const clients = sseClients.get(sessionId) || []
         clients.forEach(client => {
-          client.write(`data: ${JSON.stringify({ error: 'Invalid number or WhatsApp rejected the request.\nPlease check the number and try again.' })}\n\n`)
+          client.write(`data: ${JSON.stringify({ 
+            error: 'Invalid number or WhatsApp rejected the request.\nPlease check the number and try again.' 
+          })}\n\n`)
         })
       }
     }
@@ -102,7 +121,7 @@ app.post('/generate', async (req, res) => {
     if (connection === 'open') {
       console.log(`✅ [VANGUARD] Successfully paired for +${phone}`)
 
-      // ── AUTO SEND creds.json TO THE USER ──
+      // AUTO SEND creds.json
       try {
         const credsPath = path.join(sessionDir, 'creds.json')
         if (fs.existsSync(credsPath)) {
@@ -119,22 +138,21 @@ app.post('/generate', async (req, res) => {
                      `Then restart your bot.\n\n` +
                      `Made with love by Mr.Admin Blue 2026 🔥`
           })
-          console.log(`📤 creds.json sent to +${phone}`)
         }
       } catch (e) {
         console.log('Failed to send creds:', e.message)
       }
 
-      // Cleanup after 15 seconds
+      // Cleanup
       setTimeout(() => {
         sock.end()
         activeSessions.delete(sessionId)
         sseClients.delete(sessionId)
+        pairingRequested.delete(sessionId)
         try { fs.rmSync(sessionDir, { recursive: true, force: true }) } catch (_) {}
       }, 15000)
     }
 
-    // Reconnect magic (kept from your original index.js)
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode
       if (statusCode !== DisconnectReason.loggedOut && statusCode !== 401) {
