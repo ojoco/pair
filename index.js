@@ -158,10 +158,10 @@ async function startPairingSession(sessionId, phone, res) {
         
         const caption = 
           '╭───────────────━⊷\n' +
-          '┃ 🔐 *VANGUARD MD SESSION*\n' +
+          '┃ 🔐 *VANGUARD MD SESSION ID* 🪪\n' +
           '╰───────────────━⊷\n' +
           '╭───────────────━⊷\n' +
-          '┃ ✅ *Pairing Successful!*\n' +
+          '┃ ✅ *Verified ,Active And Working!*\n' +
           '┃\n' +
           '┃ 📋 *Your Session ID above*\n' +
           '┃    Copy the ENTIRE message\n' +
@@ -170,8 +170,8 @@ async function startPairingSession(sessionId, phone, res) {
           '┃    Paste in your .env file:\n' +
           '┃    SESSION_ID=your_id_here\n' +
           '┃\n' +
-          '┃ 💾 *Pure Base64 format*\n' +
-          '┃    No expiry - No cloud!\n' +
+          '┃ 🔐 *Keep your Credentials secure*\n' +
+          '┃    Do not share with untrusted persons!\n' +
           '┃\n' +
           '┃ 💡 *Need help?*\n' +
           '┃    https://whatsapp.com/channel/0029Vb6RoNb0bIdgZPwcst2Y\n' +
