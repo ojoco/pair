@@ -1,7 +1,6 @@
 // ================================================
-//  VANGUARD MD - Pairing Site (DUAL‑MODE v7)
-//  MD mode: code + session ID sent to user
-//  MAX mode: code + creds.json downloadable
+//  VANGUARD MD - Pairing Site (PURE BASE64 v6)
+//  Format: VANGUARD-MD;;;[pure Base64 of creds.json]
 //  Made with love by Mr.Admin Blue 2026 🔥
 // ================================================
 const express = require('express')
@@ -30,7 +29,7 @@ const sseClients = new Map()
 
 const BOT_IMAGE_PATH = path.join(__dirname, 'assets', 'botimage.jpg')
 
-// ====================== SSE (unchanged) ======================
+// ====================== SSE ======================
 app.get('/events', (req, res) => {
   const sessionId = req.query.sessionId
   if (!sessionId) return res.status(400).end()
@@ -66,21 +65,26 @@ function sendToClients(sessionId, data) {
 
 // ====================== CREATE SESSION ID ======================
 function createSessionId(credsPath) {
-  if (!fs.existsSync(credsPath)) throw new Error('creds.json not found')
+  if (!fs.existsSync(credsPath)) {
+    throw new Error('creds.json not found')
+  }
+  
   const credsData = fs.readFileSync(credsPath)
   const base64Creds = credsData.toString('base64')
+  
+  // Simple format: VANGUARD-MD;;;[pure Base64]
   return `VANGUARD-MD;;;${base64Creds}`
 }
 
 // ====================== CORE PAIRING ======================
-async function startPairingSession(sessionId, phone, mode) {
+async function startPairingSession(sessionId, phone, res) {
   const sessionDir = path.join(__dirname, 'sessions', sessionId)
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
   
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
   const { version } = await fetchLatestBaileysVersion()
   
-  console.log(`[${sessionId}] 🚀 Starting socket for +${phone} (${mode} mode)`)
+  console.log(`[${sessionId}] 🚀 Starting socket for +${phone}`)
   
   const userJid = phone + '@s.whatsapp.net'
   
@@ -111,8 +115,6 @@ async function startPairingSession(sessionId, phone, mode) {
     reconnectAttempts: 0,
     maxReconnects: 5,
     cleanupTimer: null,
-    mode,               // 'md' or 'max'
-    credsReady: false,
   }
   
   activeSessions.set(sessionId, session)
@@ -138,82 +140,78 @@ async function startPairingSession(sessionId, phone, mode) {
     
     if (connection === 'open') {
       session.paired = true
-      sendToClients(sessionId, { status: 'paired' })
+      sendToClients(sessionId, { status: 'paired', message: 'Generating Session ID...' })
       
       console.log(`[${sessionId}] ⏳ Waiting 8 seconds for creds.json...`)
       await delay(8000)
       
-      const credsPath = path.join(sessionDir, 'creds.json')
-      
-      if (session.mode === 'md') {
-        // MD: send Session ID to user (original behaviour)
-        try {
-          if (!fs.existsSync(credsPath)) throw new Error('creds.json not found')
-          const vanguardSessionId = createSessionId(credsPath)
-          console.log(`[${sessionId}] ✅ Session ID created (${vanguardSessionId.length} chars)`)
-          
-          await sock.sendMessage(session.userJid, { text: '⏳ *Generating Session ID...*' })
-          await sock.sendMessage(session.userJid, { text: vanguardSessionId })
-          
-          const caption = 
-            '╭───────────────━⊷\n' +
-            '┃ 🔐 *VANGUARD MD SESSION ID* 🪪\n' +
-            '╰───────────────━⊷\n' +
-            '╭───────────────━⊷\n' +
-            '┃ ✅ *Verified ,Active And Working!*\n' +
-            '┃\n' +
-            '┃ 📋 *Your Session ID above*\n' +
-            '┃    Copy the ENTIRE message\n' +
-            '┃\n' +
-            '┃ 🚀 *Deploy instantly:*\n' +
-            '┃    Paste in your .env file:\n' +
-            '┃    SESSION_ID=your_id_here\n' +
-            '┃\n' +
-            '┃ 🔐 *Keep your Credentials secure*\n' +
-            '┃    Do not share with untrusted persons!\n' +
-            '┃\n' +
-            '┃ 💡 *Need help?*\n' +
-            '┃    https://whatsapp.com/channel/0029Vb6RoNb0bIdgZPwcst2Y\n' +
-            '╰───────────────━⊷\n' +
-            '> *_Made With Love By Admin Blue_*\n' +
-            '> *_VANGUARD MD is on Fire 🔥_*'
-          
-          if (fs.existsSync(BOT_IMAGE_PATH)) {
-            const imageBuffer = fs.readFileSync(BOT_IMAGE_PATH)
-            await sock.sendMessage(session.userJid, { image: imageBuffer, caption })
-          } else {
-            await sock.sendMessage(session.userJid, { text: caption })
-          }
-          
-          sendToClients(sessionId, { 
-            status: 'done', 
-            message: 'Session ID sent to your WhatsApp!',
-            sessionIdLength: vanguardSessionId.length
-          })
-        } catch (err) {
-          console.error(`[${sessionId}] ❌ Error: ${err.message}`)
-          sendToClients(sessionId, { error: err.message })
-          // fallback: send creds.json as document
-          try {
-            if (fs.existsSync(credsPath)) {
-              const buffer = fs.readFileSync(credsPath)
-              await sock.sendMessage(session.userJid, {
-                document: buffer,
-                mimetype: 'application/json',
-                fileName: 'creds.json',
-                caption: '⚠️ Fallback: Save to /session folder'
-              })
-            }
-          } catch (_) {}
+      try {
+        const credsPath = path.join(sessionDir, 'creds.json')
+        if (!fs.existsSync(credsPath)) throw new Error('creds.json not found')
+        
+        const vanguardSessionId = createSessionId(credsPath)
+        console.log(`[${sessionId}] ✅ Session ID created (${vanguardSessionId.length} chars)`)
+        
+        // Send 3 messages
+        await sock.sendMessage(session.userJid, { text: '⏳ *Generating Session ID...*' })
+        await sock.sendMessage(session.userJid, { text: vanguardSessionId })
+        
+        const caption = 
+          '╭───────────────━⊷\n' +
+          '┃ 🔐 *VANGUARD MD SESSION ID* 🪪\n' +
+          '╰───────────────━⊷\n' +
+          '╭───────────────━⊷\n' +
+          '┃ ✅ *Verified ,Active And Working!*\n' +
+          '┃\n' +
+          '┃ 📋 *Your Session ID above*\n' +
+          '┃    Copy the ENTIRE message\n' +
+          '┃\n' +
+          '┃ 🚀 *Deploy instantly:*\n' +
+          '┃    Paste in your .env file:\n' +
+          '┃    SESSION_ID=your_id_here\n' +
+          '┃\n' +
+          '┃ 🔐 *Keep your Credentials secure*\n' +
+          '┃    Do not share with untrusted persons!\n' +
+          '┃\n' +
+          '┃ 💡 *Need help?*\n' +
+          '┃    https://whatsapp.com/channel/0029Vb6RoNb0bIdgZPwcst2Y\n' +
+          '╰───────────────━⊷\n' +
+          '> *_Made With Love By Admin Blue_*\n' +
+          '> *_VANGUARD MD is on Fire 🔥_*'
+        
+        if (fs.existsSync(BOT_IMAGE_PATH)) {
+          const imageBuffer = fs.readFileSync(BOT_IMAGE_PATH)
+          await sock.sendMessage(session.userJid, { image: imageBuffer, caption })
+        } else {
+          await sock.sendMessage(session.userJid, { text: caption })
         }
-      } else {
-        // MAX mode: just mark creds as ready (bot will download)
-        session.credsReady = true
-        sendToClients(sessionId, { status: 'creds_ready', message: 'Credentials ready for download' })
-        console.log(`[${sessionId}] Creds ready for MAX download`)
+        
+        sendToClients(sessionId, { 
+          status: 'done', 
+          message: 'Session ID sent to your WhatsApp!',
+          sessionIdLength: vanguardSessionId.length
+        })
+        
+      } catch (err) {
+        console.error(`[${sessionId}] ❌ Error: ${err.message}`)
+        sendToClients(sessionId, { error: err.message })
+        
+        // Fallback
+        try {
+          const credsPath = path.join(sessionDir, 'creds.json')
+          if (fs.existsSync(credsPath)) {
+            const buffer = fs.readFileSync(credsPath)
+            await sock.sendMessage(session.userJid, {
+              document: buffer,
+              mimetype: 'application/json',
+              fileName: 'creds.json',
+              caption: '⚠️ Fallback: Save to /session folder'
+            })
+          }
+        } catch (_) {}
       }
       
-      session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), 300000) // 5 min to download
+      session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), 15000)
     }
     
     if (connection === 'close') {
@@ -234,7 +232,7 @@ async function startPairingSession(sessionId, phone, mode) {
         await delay(waitMs)
         try { sock.end() } catch (_) {}
         activeSessions.delete(sessionId)
-        startPairingSession(sessionId, phone, mode)
+        startPairingSession(sessionId, phone, null)
       } else {
         sendToClients(sessionId, { error: 'Max retries reached' })
         cleanupSession(sessionId)
@@ -254,68 +252,23 @@ async function startPairingSession(sessionId, phone, mode) {
   }
 }
 
-// ====================== ENDPOINTS ======================
-
-// MD mode (original)
 app.post('/generate', async (req, res) => {
   const { phone } = req.body
   if (!phone || phone.length < 9) {
     return res.status(400).json({ error: 'Invalid phone number' })
   }
+  
   const cleanPhone = phone.replace(/[^0-9]/g, '')
   const sessionId = `pair-${Date.now()}`
-  res.json({ success: true, sessionId })
-  startPairingSession(sessionId, cleanPhone, 'md').catch(err => {
-    sendToClients(sessionId, { error: 'Internal error' })
-    cleanupSession(sessionId)
-  })
-})
-
-// MAX mode (code + creds download)
-app.post('/generate-max', async (req, res) => {
-  const { phone } = req.body
-  if (!phone || phone.length < 9) {
-    return res.status(400).json({ error: 'Invalid phone number' })
-  }
-  const cleanPhone = phone.replace(/[^0-9]/g, '')
-  const sessionId = `pairmax-${Date.now()}`
-  res.json({ success: true, sessionId })
-  startPairingSession(sessionId, cleanPhone, 'max').catch(err => {
-    sendToClients(sessionId, { error: 'Internal error' })
-    cleanupSession(sessionId)
-  })
-})
-
-// Get pairing code (polling)
-app.get('/getcode/:sessionId', (req, res) => {
-  const session = activeSessions.get(req.params.sessionId)
-  if (!session) return res.status(404).json({ error: 'Session not found' })
-  if (session.codeGenerated) {
-    return res.json({ code: session.code }) // but we don't store the raw code? We'll store it.
-  }
-  return res.json({ code: null })  // not ready yet
-})
-
-// Download creds.json (MAX only)
-app.get('/getcreds/:sessionId', (req, res) => {
-  const session = activeSessions.get(req.params.sessionId)
-  if (!session) return res.status(404).json({ error: 'Session not found' })
-  if (session.mode !== 'max') return res.status(400).json({ error: 'Not a MAX session' })
-  if (!session.credsReady) return res.status(400).json({ error: 'Credentials not ready yet' })
   
-  const credsPath = path.join(session.sessionDir, 'creds.json')
-  try {
-    const credsBuffer = fs.readFileSync(credsPath)
-    const base64Creds = credsBuffer.toString('base64')
-    // Clean up after successful download
+  res.json({ success: true, sessionId })
+  
+  startPairingSession(sessionId, cleanPhone).catch(err => {
+    sendToClients(sessionId, { error: 'Internal error' })
     cleanupSession(sessionId)
-    return res.json({ success: true, creds: base64Creds })
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to read credentials' })
-  }
+  })
 })
 
-// ====================== CLEANUP ======================
 function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId)
   if (session) {
@@ -328,6 +281,6 @@ function cleanupSession(sessionId) {
 }
 
 app.listen(PORT, () => {
-  console.log(`🚀 VANGUARD MD Dual‑Mode Pairing Site LIVE → http://localhost:${PORT}`)
-  console.log(`👑 MD mode: /generate | MAX mode: /generate-max`)
+  console.log(`🚀 VANGUARD MD Pairing Site LIVE -> http://localhost:${PORT}`)
+  console.log(`👑 Pure Base64 v6 | Made by Mr.Admin Blue 2026`)
 })
