@@ -1,8 +1,7 @@
 // ================================================
-//  VANGUARD MD - Pairing Site (DUAL‑MODE v7)
-//  MD mode: code + session ID sent to user
-//  MAX mode: code + creds.json downloadable
-//  Made with love by Mr.Admin Blue 2026 🔥
+//  VANGUARD MD - Pairing Site (POLLING‑FIXED v8)
+//  Stores code + creds in memory so bots can poll.
+//  Uses correct HTTP status codes.
 // ================================================
 const express = require('express')
 const cors = require('cors')
@@ -113,6 +112,8 @@ async function startPairingSession(sessionId, phone, mode) {
     cleanupTimer: null,
     mode,               // 'md' or 'max'
     credsReady: false,
+    code: null,         // ★ STORE THE CODE
+    credsBuffer: null,  // ★ STORE CREDS BUFFER (for MAX)
   }
   
   activeSessions.set(sessionId, session)
@@ -124,6 +125,7 @@ async function startPairingSession(sessionId, phone, mode) {
     try {
       let code = await sock.requestPairingCode(phone)
       code = code?.match(/.{1,4}/g)?.join('-') || code
+      session.code = code               // ★ save code in memory
       session.codeGenerated = true
       console.log(`[${sessionId}] ✅ Pairing code: ${code}`)
       sendToClients(sessionId, { code })
@@ -193,7 +195,6 @@ async function startPairingSession(sessionId, phone, mode) {
         } catch (err) {
           console.error(`[${sessionId}] ❌ Error: ${err.message}`)
           sendToClients(sessionId, { error: err.message })
-          // fallback: send creds.json as document
           try {
             if (fs.existsSync(credsPath)) {
               const buffer = fs.readFileSync(credsPath)
@@ -207,13 +208,24 @@ async function startPairingSession(sessionId, phone, mode) {
           } catch (_) {}
         }
       } else {
-        // MAX mode: just mark creds as ready (bot will download)
-        session.credsReady = true
-        sendToClients(sessionId, { status: 'creds_ready', message: 'Credentials ready for download' })
-        console.log(`[${sessionId}] Creds ready for MAX download`)
+        // MAX mode: store creds buffer in memory
+        try {
+          if (fs.existsSync(credsPath)) {
+            session.credsBuffer = fs.readFileSync(credsPath)   // ★ store buffer
+            session.credsReady = true
+            sendToClients(sessionId, { status: 'creds_ready', message: 'Credentials ready for download' })
+            console.log(`[${sessionId}] Creds stored in memory for MAX download`)
+          } else {
+            sendToClients(sessionId, { error: 'creds.json not found after pairing' })
+          }
+        } catch (err) {
+          sendToClients(sessionId, { error: 'Failed to read creds.json' })
+        }
       }
       
-      session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), 300000) // 5 min to download
+      // Extended cleanup: 10 minutes for MD, 30 minutes for MAX (to allow download)
+      const cleanupDelay = session.mode === 'max' ? 30 * 60 * 1000 : 10 * 60 * 1000
+      session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), cleanupDelay)
     }
     
     if (connection === 'close') {
@@ -256,7 +268,7 @@ async function startPairingSession(sessionId, phone, mode) {
 
 // ====================== ENDPOINTS ======================
 
-// MD mode (original)
+// MD mode
 app.post('/generate', async (req, res) => {
   const { phone } = req.body
   if (!phone || phone.length < 9) {
@@ -271,7 +283,7 @@ app.post('/generate', async (req, res) => {
   })
 })
 
-// MAX mode (code + creds download)
+// MAX mode
 app.post('/generate-max', async (req, res) => {
   const { phone } = req.body
   if (!phone || phone.length < 9) {
@@ -286,33 +298,45 @@ app.post('/generate-max', async (req, res) => {
   })
 })
 
-// Get pairing code (polling)
+// ★ Get pairing code – returns 202 while waiting, 200 when ready
 app.get('/getcode/:sessionId', (req, res) => {
   const session = activeSessions.get(req.params.sessionId)
   if (!session) return res.status(404).json({ error: 'Session not found' })
-  if (session.codeGenerated) {
-    return res.json({ code: session.code }) // but we don't store the raw code? We'll store it.
+  
+  if (session.code) {
+    // Code already generated – send it and mark that we've served it (still keep session)
+    const code = session.code
+    // Don't delete the session yet; let it live until cleanup
+    return res.json({ code })
   }
-  return res.json({ code: null })  // not ready yet
+  
+  if (session.paired) {
+    // Already paired – no code will be generated
+    return res.json({ status: 'already_paired' })
+  }
+  
+  // Still generating – tell client to keep polling
+  return res.status(202).json({ code: null })   // ★ 202 = "still processing"
 })
 
-// Download creds.json (MAX only)
+// ★ Get credentials (MAX only) – returns 202 while not ready, 200 with creds when ready
 app.get('/getcreds/:sessionId', (req, res) => {
   const session = activeSessions.get(req.params.sessionId)
   if (!session) return res.status(404).json({ error: 'Session not found' })
   if (session.mode !== 'max') return res.status(400).json({ error: 'Not a MAX session' })
-  if (!session.credsReady) return res.status(400).json({ error: 'Credentials not ready yet' })
   
-  const credsPath = path.join(session.sessionDir, 'creds.json')
-  try {
-    const credsBuffer = fs.readFileSync(credsPath)
-    const base64Creds = credsBuffer.toString('base64')
-    // Clean up after successful download
-    cleanupSession(sessionId)
+  if (session.credsReady && session.credsBuffer) {
+    // Return the stored buffer as base64
+    const base64Creds = session.credsBuffer.toString('base64')
+    // Do NOT cleanup – the bot may need to retry. Cleanup will happen later via timer.
     return res.json({ success: true, creds: base64Creds })
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to read credentials' })
   }
+  
+  if (session.paired) {
+    return res.json({ status: 'already_paired', message: 'Waiting for creds file to be read...' })
+  }
+  
+  return res.status(202).json({ status: 'generating' })
 })
 
 // ====================== CLEANUP ======================
@@ -328,6 +352,6 @@ function cleanupSession(sessionId) {
 }
 
 app.listen(PORT, () => {
-  console.log(`🚀 VANGUARD MD Dual‑Mode Pairing Site LIVE → http://localhost:${PORT}`)
+  console.log(`🚀 VANGUARD MD Dual‑Mode Pairing Site (POLLING FIXED) LIVE → http://localhost:${PORT}`)
   console.log(`👑 MD mode: /generate | MAX mode: /generate-max`)
 })
