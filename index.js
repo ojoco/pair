@@ -1,7 +1,7 @@
 // ================================================
-//  VANGUARD MD - Pairing Site v10
-//  MD mode | MAX mode | QR mode
-//  MD now sends session ID with copy button (no image)
+//  VANGUARD MD - Pairing Site v12
+//  MD | MAX | QR
+//  MD and QR both send session ID via DM
 // ================================================
 const express = require('express')
 const cors = require('cors')
@@ -176,29 +176,40 @@ async function startPairingSession(sessionId, phone, mode) {
       session.paired = true
       sendToClients(sessionId, { status: 'paired' })
 
+      // ✅ Resolve user JID for QR mode (scanner's account is now known)
+      if (!session.userJid && sock.authState?.creds?.me?.id) {
+        session.userJid = sock.authState.creds.me.id.split(':')[0] + '@s.whatsapp.net'
+        console.log(`[${sessionId}] 👤 QR user JID resolved: ${session.userJid}`)
+      }
+
       console.log(`[${sessionId}] ⏳ Waiting 8 seconds for creds.json...`)
       await delay(8000)
 
       const credsPath = path.join(sessionDir, 'creds.json')
 
-      if (mode === 'md') {
-        // ── MD: session ID with copy button, no image ──
+      // ── MD and QR: send session ID via DM ──
+      if (mode === 'md' || mode === 'qr') {
         try {
           if (!fs.existsSync(credsPath)) throw new Error('creds.json not found')
           const vanguardSessionId = createSessionId(credsPath)
           console.log(`[${sessionId}] ✅ Session ID created (${vanguardSessionId.length} chars)`)
+
+          // For QR: also stash creds buffer for any polling consumers
+          if (mode === 'qr') {
+            try {
+              session.credsBuffer = fs.readFileSync(credsPath)
+              session.credsReady = true
+            } catch (_) {}
+          }
 
           // 1. Generating status
           await sock.sendMessage(session.userJid, {
             text: '⏳ *Generating Session ID...*'
           })
 
-          // 2. Session ID with copy button
+          // 2. Session ID as plain text
           await sock.sendMessage(session.userJid, {
-            text: vanguardSessionId,
-            nativeFlow: [
-              { text: '📋 Copy Session ID', copy: vanguardSessionId }
-            ]
+            text: vanguardSessionId
           })
 
           // 3. Simple card below
@@ -235,7 +246,7 @@ async function startPairingSession(sessionId, phone, mode) {
           } catch (_) {}
         }
       } else {
-        // MAX + QR: store creds buffer for polling download
+        // MAX: store creds buffer for polling download
         try {
           if (fs.existsSync(credsPath)) {
             session.credsBuffer = fs.readFileSync(credsPath)
@@ -250,7 +261,7 @@ async function startPairingSession(sessionId, phone, mode) {
         }
       }
 
-      const cleanupDelay = mode === 'md' ? 10 * 60 * 1000 : 30 * 60 * 1000
+      const cleanupDelay = mode === 'max' ? 30 * 60 * 1000 : 10 * 60 * 1000
       session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), cleanupDelay)
     }
 
@@ -397,6 +408,6 @@ function cleanupSession(sessionId) {
 }
 
 app.listen(PORT, () => {
-  console.log(`🚀 VANGUARD MD Pairing Site v10 LIVE → http://localhost:${PORT}`)
+  console.log(`🚀 VANGUARD MD Pairing Site v12 LIVE → http://localhost:${PORT}`)
   console.log(`👑 MD: /generate | MAX: /generate-max | QR: /generate-qr`)
 })
