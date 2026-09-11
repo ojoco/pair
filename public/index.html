@@ -27,6 +27,32 @@
     .logo { width: 90px; height: 90px; background: #000; border-radius: 50%; margin: 0 auto 15px; display: flex; align-items: center; justify-content: center; font-size: 42px; }
     h1 { margin: 0 0 8px; font-size: 28px; }
     p { color: #555; margin-bottom: 25px; }
+
+    /* Mode toggle */
+    .toggle {
+      display: flex;
+      background: #f3f3f3;
+      border-radius: 12px;
+      padding: 4px;
+      margin-bottom: 25px;
+      border: 1px solid #eee;
+    }
+    .toggle-option {
+      flex: 1;
+      padding: 12px 10px;
+      text-align: center;
+      cursor: pointer;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      color: #111;
+      transition: all 0.2s ease;
+    }
+    .toggle-option.active {
+      background: #000;
+      color: #fff;
+    }
+
     input {
       width: 100%;
       padding: 16px 20px;
@@ -36,6 +62,7 @@
       margin-bottom: 20px;
       text-align: center;
       font-weight: 500;
+      box-sizing: border-box;
     }
     button {
       width: 100%;
@@ -78,6 +105,30 @@
       align-items: center;
       justify-content: center;
     }
+    .qr-box {
+      background: #f8f8f8;
+      border-radius: 16px;
+      padding: 25px 15px;
+      margin: 20px 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+    }
+    .qr-box img {
+      width: 100%;
+      max-width: 260px;
+      height: auto;
+      border-radius: 12px;
+      background: #fff;
+      padding: 10px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+    }
+    .qr-box small {
+      color: #666;
+      margin-top: 15px;
+      font-size: 13px;
+      line-height: 1.6;
+    }
     .copy-btn {
       width: 100%;
       padding: 14px;
@@ -92,31 +143,53 @@
     }
     footer { margin-top: 40px; font-size: 13px; color: #888; }
     .error { color: #e11d48; font-weight: 500; margin: 15px 0; }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
   <div class="card">
     <div class="logo">🤖</div>
     <h1>VANGUARD MD</h1>
-    <p>Pair Code • Link your WhatsApp device</p>
+    <p>Link your WhatsApp device</p>
 
-    <input type="text" id="phone" placeholder="256745626308" required>
+    <div class="toggle">
+      <div class="toggle-option active" id="togglePair" onclick="setMode('pair')">🔑 Pair Code</div>
+      <div class="toggle-option" id="toggleQr" onclick="setMode('qr')">📱 QR Code</div>
+    </div>
 
-    <button onclick="generatePairCode()">🔑 Generate Pair Code</button>
+    <!-- Pair code UI -->
+    <div id="pairBlock">
+      <input type="text" id="phone" placeholder="256745626308" required>
+      <button onclick="generatePairCode()">🔑 Generate Pair Code</button>
+    </div>
 
-    <!-- Loading Animation -->
+    <!-- QR UI -->
+    <div id="qrBlock" class="hidden">
+      <button onclick="generateQr()">📱 Generate QR Code</button>
+    </div>
+
+    <!-- Loading -->
     <div id="loader" class="loader">
       <div class="spinner"></div>
-      <strong>Requesting pair code from WhatsApp...</strong>
+      <strong id="loaderText">Requesting...</strong>
       <small style="color:#666; margin-top:8px;">This usually takes 5–20 seconds</small>
     </div>
 
-    <!-- Result -->
+    <!-- Pair code result -->
     <div id="result" style="display:none;">
       <div class="code-box" id="codeDisplay">••••-••••-••••</div>
       <button class="copy-btn" onclick="copyCode()">📋 Copy Code</button>
       <small style="color:#555; display:block; margin-top:15px;">
         WhatsApp → Linked Devices → Link with phone number
+      </small>
+    </div>
+
+    <!-- QR result -->
+    <div id="qrBox" class="qr-box">
+      <img id="qrImage" src="" alt="QR">
+      <small>
+        Open WhatsApp → Linked Devices → <b>Link a Device</b><br>
+        Scan the QR above. Refreshes automatically.
       </small>
     </div>
 
@@ -129,67 +202,158 @@
   </footer>
 
   <script>
-    let currentSessionId = null;
-    let currentCode = '';
+    let currentSessionId = null
+    let currentCode = ''
+    let currentMode = 'pair'
+    let qrPoller = null
+    let lastQrVersion = -1
+    let sse = null
 
+    function setMode(mode) {
+      if (mode === currentMode) return
+      currentMode = mode
+
+      document.getElementById('togglePair').classList.toggle('active', mode === 'pair')
+      document.getElementById('toggleQr').classList.toggle('active', mode === 'qr')
+
+      // Reset UI
+      hideAll()
+      document.getElementById('pairBlock').classList.toggle('hidden', mode !== 'pair')
+      document.getElementById('qrBlock').classList.toggle('hidden', mode !== 'qr')
+
+      // Stop previous polling / SSE
+      if (qrPoller) { clearInterval(qrPoller); qrPoller = null }
+      if (sse) { try { sse.close() } catch(_) {} sse = null }
+      currentSessionId = null
+      lastQrVersion = -1
+    }
+
+    function hideAll() {
+      document.getElementById('result').style.display = 'none'
+      document.getElementById('qrBox').style.display = 'none'
+      document.getElementById('loader').style.display = 'none'
+      document.getElementById('errorMsg').style.display = 'none'
+    }
+
+    // ───── Pair code flow ─────
     async function generatePairCode() {
-      const phone = document.getElementById('phone').value.trim();
+      const phone = document.getElementById('phone').value.trim()
       if (!phone || phone.length < 9) {
-        showError('Please enter a valid number (e.g. 256745626308)');
-        return;
+        return showError('Please enter a valid number (e.g. 256745626308)')
       }
 
-      // Reset
-      document.getElementById('result').style.display = 'none';
-      document.getElementById('errorMsg').style.display = 'none';
-      const loader = document.getElementById('loader');
-      loader.style.display = 'flex';
+      hideAll()
+      showLoader(true, 'Requesting pair code from WhatsApp...')
 
-      const res = await fetch('/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone })
-      });
-
-      const data = await res.json();
-      if (!data.success) {
-        loader.style.display = 'none';
-        showError(data.error || 'Failed to start pairing');
-        return;
-      }
-
-      currentSessionId = data.sessionId;
-
-      // SSE for real-time code or error
-      const evtSource = new EventSource(`/events?sessionId=${currentSessionId}`);
-      evtSource.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        loader.style.display = 'none';
-
-        if (msg.error) {
-          showError(msg.error);
-        } else if (msg.code) {
-          currentCode = msg.code;
-          document.getElementById('codeDisplay').textContent = msg.code;
-          document.getElementById('result').style.display = 'block';
+      try {
+        const res = await fetch('/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone })
+        })
+        const data = await res.json()
+        if (!data.success) {
+          showLoader(false)
+          return showError(data.error || 'Failed to start pairing')
         }
-      };
+
+        currentSessionId = data.sessionId
+
+        sse = new EventSource(`/events?sessionId=${currentSessionId}`)
+        sse.onmessage = (e) => {
+          const msg = JSON.parse(e.data)
+          if (msg.error) {
+            showLoader(false)
+            showError(msg.error)
+          } else if (msg.code) {
+            showLoader(false)
+            currentCode = msg.code
+            document.getElementById('codeDisplay').textContent = msg.code
+            document.getElementById('result').style.display = 'block'
+          }
+        }
+      } catch (err) {
+        showLoader(false)
+        showError('Network error: ' + err.message)
+      }
+    }
+
+    // ───── QR flow ─────
+    async function generateQr() {
+      hideAll()
+      showLoader(true, 'Generating QR code...')
+
+      try {
+        const res = await fetch('/generate-qr', { method: 'POST' })
+        const data = await res.json()
+        if (!data.success) {
+          showLoader(false)
+          return showError(data.error || 'Failed to start QR session')
+        }
+
+        currentSessionId = data.sessionId
+        lastQrVersion = -1
+
+        // Poll every 2s
+        qrPoller = setInterval(pollQr, 2000)
+        pollQr() // immediate first check
+      } catch (err) {
+        showLoader(false)
+        showError('Network error: ' + err.message)
+      }
+    }
+
+    async function pollQr() {
+      if (!currentSessionId) return
+      try {
+        const res = await fetch(`/getqr/${currentSessionId}`)
+        if (res.status === 202) return // still waiting
+
+        const data = await res.json()
+
+        if (data.status === 'already_paired') {
+          clearInterval(qrPoller); qrPoller = null
+          showLoader(false)
+          document.getElementById('qrBox').style.display = 'none'
+          showError('✅ Paired successfully. You can close this page.')
+          return
+        }
+
+        if (data.qr && data.qrVersion !== lastQrVersion) {
+          lastQrVersion = data.qrVersion
+          showLoader(false)
+          document.getElementById('qrImage').src = data.qr
+          document.getElementById('qrBox').style.display = 'flex'
+        }
+
+        if (data.error) {
+          clearInterval(qrPoller); qrPoller = null
+          showLoader(false)
+          showError(data.error)
+        }
+      } catch (_) {}
+    }
+
+    function showLoader(show, text) {
+      const el = document.getElementById('loader')
+      if (text) document.getElementById('loaderText').textContent = text
+      el.style.display = show ? 'flex' : 'none'
     }
 
     function showError(text) {
-      const err = document.getElementById('errorMsg');
-      err.textContent = text;
-      err.style.display = 'block';
+      const err = document.getElementById('errorMsg')
+      err.textContent = text
+      err.style.display = 'block'
     }
 
     function copyCode() {
-      if (!currentCode) return;
+      if (!currentCode) return
       navigator.clipboard.writeText(currentCode).then(() => {
-        const btn = document.querySelector('.copy-btn');
-        const original = btn.textContent;
-        btn.textContent = '✅ Copied!';
-        setTimeout(() => { btn.textContent = original; }, 2000);
-      });
+        const btn = document.querySelector('.copy-btn')
+        const original = btn.textContent
+        btn.textContent = '✅ Copied!'
+        setTimeout(() => { btn.textContent = original }, 2000)
+      })
     }
   </script>
 </body>
