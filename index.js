@@ -1,7 +1,19 @@
 // ================================================
-//  VANGUARD MD - Pairing Site v13
+//  VANGUARD MD — Pairing Site v14
 //  MD | MAX | QR | QR-MAX
 //  QR-MAX: QR capture + creds buffer (no DM)
+//
+//  REVISION:
+//   • Waits for creds.json to be COMPLETE before exposing them.
+//     Baileys writes `me.id` early and flips `registered: true`
+//     a moment later — clients that consumed the buffer too soon
+//     got "half creds" and had to heal them.
+//   • Heals `registered: true` in-place if the flag is still
+//     false after a grace period. Writes the healed copy back
+//     to disk so downstream consumers always see valid creds.
+//   • Hard-rejects creds missing me.id (pairing never completed).
+//   • Fixed userJid construction (was doing a weird string
+//     replace; now clean `phone@s.whatsapp.net`).
 // ================================================
 const express = require('express')
 const cors = require('cors')
@@ -86,6 +98,55 @@ const isQrMode    = (mode) => mode === 'qr' || mode === 'qr-max'
 const isDmMode    = (mode) => mode === 'md' || mode === 'qr'        // sends session ID via DM
 const isCredsMode = (mode) => mode === 'max' || mode === 'qr-max'   // stores creds buffer for polling
 
+// ====================== CREDS COMPLETENESS ======================
+// Baileys produces `me.id` early but flips `registered: true` a
+// beat later. A creds.json is only safe to export when BOTH are set.
+function isCredsComplete(creds) {
+  return Boolean(creds && creds.me && creds.me.id && creds.registered === true)
+}
+
+function isCredsUsable(creds) {
+  // Identity alone is enough for Baileys to connect; `registered`
+  // only guards the pair-prompt. If identity exists we can heal.
+  return Boolean(creds && creds.me && creds.me.id)
+}
+
+// Read + heal creds.json. Returns parsed object or null.
+// Writes the healed copy back to disk so future restarts are clean.
+async function readAndHealCreds(credsPath, { maxWaitMs = 15000 } = {}) {
+  const start = Date.now()
+  let last = null
+
+  while (Date.now() - start < maxWaitMs) {
+    if (fs.existsSync(credsPath)) {
+      try {
+        last = JSON.parse(fs.readFileSync(credsPath, 'utf8'))
+      } catch (_) { last = null }
+    }
+
+    // Fully complete — done immediately
+    if (isCredsComplete(last)) return last
+
+    // Identity present but flag missing — wait a bit longer in
+    // case Baileys is about to flip it on its own.
+    if (isCredsUsable(last) && Date.now() - start > 4000) {
+      last.registered = true
+      try { fs.writeFileSync(credsPath, JSON.stringify(last, null, 2)) } catch (_) {}
+      return last
+    }
+
+    await delay(400)
+  }
+
+  // Timed out — if we at least have identity, heal and return.
+  if (isCredsUsable(last)) {
+    last.registered = true
+    try { fs.writeFileSync(credsPath, JSON.stringify(last, null, 2)) } catch (_) {}
+    return last
+  }
+  return null
+}
+
 // ====================== CORE PAIRING ======================
 async function startPairingSession(sessionId, phone, mode) {
   // mode: 'md' | 'max' | 'qr' | 'qr-max'
@@ -97,7 +158,7 @@ async function startPairingSession(sessionId, phone, mode) {
 
   console.log(`[${sessionId}] 🚀 Starting socket (${mode} mode)${phone ? ' +' + phone : ''}`)
 
-  const userJid = phone ? phone + '@watsapp.net'.replace('watsapp', 'whatsapp') : null
+  const userJid = phone ? `${phone}@s.whatsapp.net` : null
 
   const sock = makeWASocket({
     version,
@@ -187,24 +248,45 @@ async function startPairingSession(sessionId, phone, mode) {
         console.log(`[${sessionId}] 👤 QR user JID resolved: ${session.userJid}`)
       }
 
-      console.log(`[${sessionId}] ⏳ Waiting 8 seconds for creds.json...`)
-      await delay(8000)
-
+      console.log(`[${sessionId}] ⏳ Waiting for complete creds.json...`)
       const credsPath = path.join(sessionDir, 'creds.json')
+
+      // ── Wait for + heal creds ──
+      const creds = await readAndHealCreds(credsPath, { maxWaitMs: 20000 })
+
+      if (!creds) {
+        console.error(`[${sessionId}] ❌ Creds never became usable`)
+        sendToClients(sessionId, { error: 'Pairing produced incomplete creds — please retry' })
+        // Do NOT cleanup — let the session poller time out naturally
+        return
+      }
+
+      if (!isCredsComplete(creds)) {
+        // Shouldn't happen — readAndHealCreds guarantees this — but
+        // if it does, don't ship broken creds downstream.
+        console.error(`[${sessionId}] ❌ Creds still incomplete after heal`)
+        sendToClients(sessionId, { error: 'Creds healing failed' })
+        return
+      }
+
+      console.log(`[${sessionId}] ✅ Creds complete (me.id=${creds.me.id}, registered=${creds.registered})`)
+
+      // Always have a fresh on-disk copy for the DM path
+      let credsBuffer = null
+      try { credsBuffer = fs.readFileSync(credsPath) } catch (_) {}
 
       if (isDmMode(mode)) {
         // ── md & qr: send session ID via DM ──
         try {
-          if (!fs.existsSync(credsPath)) throw new Error('creds.json not found')
-          const vanguardSessionId = createSessionId(credsPath)
+          if (!credsBuffer) throw new Error('creds.json not found')
+
+          const vanguardSessionId = `VANGUARD-MD;;;${credsBuffer.toString('base64')}`
           console.log(`[${sessionId}] ✅ Session ID created (${vanguardSessionId.length} chars)`)
 
           // For qr, also stash creds buffer for any polling consumers
           if (mode === 'qr') {
-            try {
-              session.credsBuffer = fs.readFileSync(credsPath)
-              session.credsReady = true
-            } catch (_) {}
+            session.credsBuffer = credsBuffer
+            session.credsReady = true
           }
 
           await sock.sendMessage(session.userJid, {
@@ -236,10 +318,9 @@ async function startPairingSession(sessionId, phone, mode) {
           console.error(`[${sessionId}] ❌ Error: ${err.message}`)
           sendToClients(sessionId, { error: err.message })
           try {
-            if (fs.existsSync(credsPath) && session.userJid) {
-              const buffer = fs.readFileSync(credsPath)
+            if (credsBuffer && session.userJid) {
               await sock.sendMessage(session.userJid, {
-                document: buffer,
+                document: credsBuffer,
                 mimetype: 'application/json',
                 fileName: 'creds.json',
                 caption: '⚠️ Fallback: Save to /session folder'
@@ -250,11 +331,11 @@ async function startPairingSession(sessionId, phone, mode) {
       } else if (isCredsMode(mode)) {
         // ── max & qr-max: store creds buffer for polling, no DM ──
         try {
-          if (fs.existsSync(credsPath)) {
-            session.credsBuffer = fs.readFileSync(credsPath)
+          if (credsBuffer) {
+            session.credsBuffer = credsBuffer
             session.credsReady = true
             sendToClients(sessionId, { status: 'creds_ready', message: 'Credentials ready for download' })
-            console.log(`[${sessionId}] Creds stored in memory`)
+            console.log(`[${sessionId}] Creds stored in memory (healed)`)
           } else {
             sendToClients(sessionId, { error: 'creds.json not found after pairing' })
           }
@@ -397,12 +478,15 @@ app.get('/getcreds/:sessionId', (req, res) => {
     return res.status(400).json({ error: 'Not a MAX/QR-MAX session' })
   }
 
+  // Only hand out creds once they've been validated as complete.
+  // If paired but creds not yet ready, tell the client to keep
+  // polling — never ship a partial buffer.
   if (session.credsReady && session.credsBuffer) {
     const base64Creds = session.credsBuffer.toString('base64')
     return res.json({ success: true, creds: base64Creds })
   }
   if (session.paired) {
-    return res.json({ status: 'already_paired', message: 'Waiting for creds file to be read...' })
+    return res.status(202).json({ status: 'preparing_creds' })
   }
   return res.status(202).json({ status: 'generating' })
 })
@@ -420,7 +504,7 @@ function cleanupSession(sessionId) {
 }
 
 app.listen(PORT, () => {
-  console.log(`🚀 VANGUARD MD Pairing Site v13 LIVE → http://localhost:${PORT}`)
+  console.log(`🚀 VANGUARD MD Pairing Site v14 LIVE → http://localhost:${PORT}`)
   console.log(`👑 MD: /generate | MAX: /generate-max`)
   console.log(`👑 QR: /generate-qr | QR-MAX: /generate-qr-max`)
 })
