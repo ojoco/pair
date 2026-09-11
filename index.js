@@ -1,12 +1,13 @@
 // ================================================
-//  VANGUARD MD - Pairing Site (POLLING‑FIXED v8)
-//  Stores code + creds in memory so bots can poll.
-//  Uses correct HTTP status codes.
+//  VANGUARD MD - Pairing Site v10
+//  MD mode | MAX mode | QR mode
+//  MD now sends session ID with copy button (no image)
 // ================================================
 const express = require('express')
 const cors = require('cors')
 const path = require('path')
 const fs = require('fs')
+const QRCode = require('qrcode')
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -27,23 +28,21 @@ app.use(express.static(path.join(__dirname, 'public')))
 const activeSessions = new Map()
 const sseClients = new Map()
 
-const BOT_IMAGE_PATH = path.join(__dirname, 'assets', 'botimage.jpg')
-
-// ====================== SSE (unchanged) ======================
+// ====================== SSE ======================
 app.get('/events', (req, res) => {
   const sessionId = req.query.sessionId
   if (!sessionId) return res.status(400).end()
-  
+
   res.setHeader('Content-Type', 'text/event-stream')
   res.setHeader('Cache-Control', 'no-cache')
   res.setHeader('Connection', 'keep-alive')
   res.flushHeaders()
-  
+
   if (!sseClients.has(sessionId)) sseClients.set(sessionId, [])
   sseClients.get(sessionId).push(res)
-  
+
   const keepAlive = setInterval(() => res.write(': ping\n\n'), 20000)
-  
+
   req.on('close', () => {
     clearInterval(keepAlive)
     const clients = sseClients.get(sessionId)
@@ -71,18 +70,30 @@ function createSessionId(credsPath) {
   return `VANGUARD-MD;;;${base64Creds}`
 }
 
+// ====================== QR → data URL ======================
+async function renderQrDataUrl(rawQr) {
+  return QRCode.toDataURL(rawQr, {
+    errorCorrectionLevel: 'M',
+    type: 'image/png',
+    quality: 0.92,
+    margin: 1,
+    color: { dark: '#000000', light: '#FFFFFF' }
+  })
+}
+
 // ====================== CORE PAIRING ======================
 async function startPairingSession(sessionId, phone, mode) {
+  // mode: 'md' | 'max' | 'qr'
   const sessionDir = path.join(__dirname, 'sessions', sessionId)
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
-  
+
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
   const { version } = await fetchLatestBaileysVersion()
-  
-  console.log(`[${sessionId}] 🚀 Starting socket for +${phone} (${mode} mode)`)
-  
-  const userJid = phone + '@s.whatsapp.net'
-  
+
+  console.log(`[${sessionId}] 🚀 Starting socket (${mode} mode)${phone ? ' +' + phone : ''}`)
+
+  const userJid = phone ? phone + '@s.whatsapp.net' : null
+
   const sock = makeWASocket({
     version,
     logger: pino({ level: 'silent' }),
@@ -98,7 +109,7 @@ async function startPairingSession(sessionId, phone, mode) {
     keepAliveIntervalMs: 10000,
     syncFullHistory: false,
   })
-  
+
   const session = {
     sock,
     phone,
@@ -110,85 +121,101 @@ async function startPairingSession(sessionId, phone, mode) {
     reconnectAttempts: 0,
     maxReconnects: 5,
     cleanupTimer: null,
-    mode,               // 'md' or 'max'
+    mode,
     credsReady: false,
-    code: null,         // ★ STORE THE CODE
-    credsBuffer: null,  // ★ STORE CREDS BUFFER (for MAX)
+    code: null,
+    credsBuffer: null,
+    qr: null,
+    qrDataUrl: null,
+    qrVersion: 0,
   }
-  
+
   activeSessions.set(sessionId, session)
-  
-  setTimeout(async () => {
-    if (session.pairingRequested || session.paired || state.creds.registered) return
-    session.pairingRequested = true
-    
-    try {
-      let code = await sock.requestPairingCode(phone)
-      code = code?.match(/.{1,4}/g)?.join('-') || code
-      session.code = code               // ★ save code in memory
-      session.codeGenerated = true
-      console.log(`[${sessionId}] ✅ Pairing code: ${code}`)
-      sendToClients(sessionId, { code })
-    } catch (err) {
-      session.pairingRequested = false
-      sendToClients(sessionId, { error: 'Could not get pairing code' })
-    }
-  }, 3000)
-  
+
+  // ── Pairing code request ONLY for md/max modes ──
+  if (mode !== 'qr') {
+    setTimeout(async () => {
+      if (session.pairingRequested || session.paired || state.creds.registered) return
+      session.pairingRequested = true
+
+      try {
+        let code = await sock.requestPairingCode(phone)
+        code = code?.match(/.{1,4}/g)?.join('-') || code
+        session.code = code
+        session.codeGenerated = true
+        console.log(`[${sessionId}] ✅ Pairing code: ${code}`)
+        sendToClients(sessionId, { code })
+      } catch (err) {
+        session.pairingRequested = false
+        sendToClients(sessionId, { error: 'Could not get pairing code' })
+      }
+    }, 3000)
+  }
+
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect } = update
-    
+    const { connection, lastDisconnect, qr } = update
+
+    // ── QR mode: capture QR and render server-side ──
+    if (qr && mode === 'qr') {
+      try {
+        session.qr = qr
+        session.qrVersion++
+        session.qrDataUrl = await renderQrDataUrl(qr)
+        console.log(`[${sessionId}] 🎯 QR v${session.qrVersion} rendered`)
+        sendToClients(sessionId, {
+          qr: session.qrDataUrl,
+          qrVersion: session.qrVersion
+        })
+      } catch (qrErr) {
+        console.error(`[${sessionId}] QR render failed:`, qrErr.message)
+        sendToClients(sessionId, { error: 'Failed to render QR code' })
+      }
+    }
+
     if (connection === 'open') {
       session.paired = true
       sendToClients(sessionId, { status: 'paired' })
-      
+
       console.log(`[${sessionId}] ⏳ Waiting 8 seconds for creds.json...`)
       await delay(8000)
-      
+
       const credsPath = path.join(sessionDir, 'creds.json')
-      
-      if (session.mode === 'md') {
-        // MD: send Session ID to user (original behaviour)
+
+      if (mode === 'md') {
+        // ── MD: session ID with copy button, no image ──
         try {
           if (!fs.existsSync(credsPath)) throw new Error('creds.json not found')
           const vanguardSessionId = createSessionId(credsPath)
           console.log(`[${sessionId}] ✅ Session ID created (${vanguardSessionId.length} chars)`)
-          
-          await sock.sendMessage(session.userJid, { text: '⏳ *Generating Session ID...*' })
-          await sock.sendMessage(session.userJid, { text: vanguardSessionId })
-          
-          const caption = 
-            '╭───────────────━⊷\n' +
-            '┃ 🔐 *VANGUARD MD SESSION ID* 🪪\n' +
-            '╰───────────────━⊷\n' +
-            '╭───────────────━⊷\n' +
-            '┃ ✅ *Verified ,Active And Working!*\n' +
-            '┃\n' +
-            '┃ 📋 *Your Session ID above*\n' +
-            '┃    Copy the ENTIRE message\n' +
-            '┃\n' +
-            '┃ 🚀 *Deploy instantly:*\n' +
-            '┃    Paste in your .env file:\n' +
-            '┃    SESSION_ID=your_id_here\n' +
-            '┃\n' +
-            '┃ 🔐 *Keep your Credentials secure*\n' +
-            '┃    Do not share with untrusted persons!\n' +
-            '┃\n' +
-            '┃ 💡 *Need help?*\n' +
-            '┃    https://whatsapp.com/channel/0029Vb6RoNb0bIdgZPwcst2Y\n' +
-            '╰───────────────━⊷\n' +
-            '> *_Made With Love By Admin Blue_*\n' +
-            '> *_VANGUARD MD is on Fire 🔥_*'
-          
-          if (fs.existsSync(BOT_IMAGE_PATH)) {
-            const imageBuffer = fs.readFileSync(BOT_IMAGE_PATH)
-            await sock.sendMessage(session.userJid, { image: imageBuffer, caption })
-          } else {
-            await sock.sendMessage(session.userJid, { text: caption })
-          }
-          
-          sendToClients(sessionId, { 
-            status: 'done', 
+
+          // 1. Generating status
+          await sock.sendMessage(session.userJid, {
+            text: '⏳ *Generating Session ID...*'
+          })
+
+          // 2. Session ID with copy button
+          await sock.sendMessage(session.userJid, {
+            text: vanguardSessionId,
+            nativeFlow: [
+              { text: '📋 Copy Session ID', copy: vanguardSessionId }
+            ]
+          })
+
+          // 3. Simple card below
+          await sock.sendMessage(session.userJid, {
+            text:
+              '╔═══━───━━━─═══╗\n' +
+              '        ✅SESSION ID\n' +
+              '╚═══━───━━━─═══╝\n' +
+              '╔═══━───━━━─═══╗\n' +
+              ' 》🟢Verified  \n' +
+              ' 》🔐Secure \n' +
+              ' 》🧑‍💻Base64\n' +
+              '╚═══━───━━━─═══╝'
+          })
+
+          sendToClients(sessionId, {
+            status: 'done',
             message: 'Session ID sent to your WhatsApp!',
             sessionIdLength: vanguardSessionId.length
           })
@@ -196,7 +223,7 @@ async function startPairingSession(sessionId, phone, mode) {
           console.error(`[${sessionId}] ❌ Error: ${err.message}`)
           sendToClients(sessionId, { error: err.message })
           try {
-            if (fs.existsSync(credsPath)) {
+            if (fs.existsSync(credsPath) && session.userJid) {
               const buffer = fs.readFileSync(credsPath)
               await sock.sendMessage(session.userJid, {
                 document: buffer,
@@ -208,13 +235,13 @@ async function startPairingSession(sessionId, phone, mode) {
           } catch (_) {}
         }
       } else {
-        // MAX mode: store creds buffer in memory
+        // MAX + QR: store creds buffer for polling download
         try {
           if (fs.existsSync(credsPath)) {
-            session.credsBuffer = fs.readFileSync(credsPath)   // ★ store buffer
+            session.credsBuffer = fs.readFileSync(credsPath)
             session.credsReady = true
             sendToClients(sessionId, { status: 'creds_ready', message: 'Credentials ready for download' })
-            console.log(`[${sessionId}] Creds stored in memory for MAX download`)
+            console.log(`[${sessionId}] Creds stored in memory`)
           } else {
             sendToClients(sessionId, { error: 'creds.json not found after pairing' })
           }
@@ -222,23 +249,22 @@ async function startPairingSession(sessionId, phone, mode) {
           sendToClients(sessionId, { error: 'Failed to read creds.json' })
         }
       }
-      
-      // Extended cleanup: 10 minutes for MD, 30 minutes for MAX (to allow download)
-      const cleanupDelay = session.mode === 'max' ? 30 * 60 * 1000 : 10 * 60 * 1000
+
+      const cleanupDelay = mode === 'md' ? 10 * 60 * 1000 : 30 * 60 * 1000
       session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), cleanupDelay)
     }
-    
+
     if (connection === 'close') {
       const status = lastDisconnect?.error?.output?.statusCode
-      
+
       if (status === DisconnectReason.loggedOut) {
         sendToClients(sessionId, { error: 'Session logged out' })
         cleanupSession(sessionId)
         return
       }
-      
+
       if (session.paired) return
-      
+
       if (session.reconnectAttempts < session.maxReconnects) {
         session.reconnectAttempts++
         const waitMs = session.reconnectAttempts * 3000
@@ -253,9 +279,9 @@ async function startPairingSession(sessionId, phone, mode) {
       }
     }
   })
-  
+
   sock.ev.on('creds.update', saveCreds)
-  
+
   if (!session.cleanupTimer) {
     session.cleanupTimer = setTimeout(() => {
       if (!session.paired) {
@@ -298,44 +324,63 @@ app.post('/generate-max', async (req, res) => {
   })
 })
 
-// ★ Get pairing code – returns 202 while waiting, 200 when ready
+// QR mode (no phone)
+app.post('/generate-qr', async (req, res) => {
+  const sessionId = `pairqr-${Date.now()}`
+  res.json({ success: true, sessionId })
+  startPairingSession(sessionId, null, 'qr').catch(err => {
+    sendToClients(sessionId, { error: 'Internal error' })
+    cleanupSession(sessionId)
+  })
+})
+
+// Pairing code polling
 app.get('/getcode/:sessionId', (req, res) => {
   const session = activeSessions.get(req.params.sessionId)
   if (!session) return res.status(404).json({ error: 'Session not found' })
-  
+
   if (session.code) {
-    // Code already generated – send it and mark that we've served it (still keep session)
-    const code = session.code
-    // Don't delete the session yet; let it live until cleanup
-    return res.json({ code })
+    return res.json({ code: session.code })
   }
-  
   if (session.paired) {
-    // Already paired – no code will be generated
     return res.json({ status: 'already_paired' })
   }
-  
-  // Still generating – tell client to keep polling
-  return res.status(202).json({ code: null })   // ★ 202 = "still processing"
+  return res.status(202).json({ code: null })
 })
 
-// ★ Get credentials (MAX only) – returns 202 while not ready, 200 with creds when ready
+// QR polling
+app.get('/getqr/:sessionId', (req, res) => {
+  const session = activeSessions.get(req.params.sessionId)
+  if (!session) return res.status(404).json({ error: 'Session not found' })
+  if (session.mode !== 'qr') return res.status(400).json({ error: 'Not a QR session' })
+
+  if (session.qrDataUrl) {
+    return res.json({
+      qr: session.qrDataUrl,
+      qrVersion: session.qrVersion
+    })
+  }
+  if (session.paired) {
+    return res.json({ status: 'already_paired' })
+  }
+  return res.status(202).json({ qr: null })
+})
+
+// Credentials polling — works for BOTH max and qr modes
 app.get('/getcreds/:sessionId', (req, res) => {
   const session = activeSessions.get(req.params.sessionId)
   if (!session) return res.status(404).json({ error: 'Session not found' })
-  if (session.mode !== 'max') return res.status(400).json({ error: 'Not a MAX session' })
-  
+  if (session.mode !== 'max' && session.mode !== 'qr') {
+    return res.status(400).json({ error: 'Not a MAX/QR session' })
+  }
+
   if (session.credsReady && session.credsBuffer) {
-    // Return the stored buffer as base64
     const base64Creds = session.credsBuffer.toString('base64')
-    // Do NOT cleanup – the bot may need to retry. Cleanup will happen later via timer.
     return res.json({ success: true, creds: base64Creds })
   }
-  
   if (session.paired) {
     return res.json({ status: 'already_paired', message: 'Waiting for creds file to be read...' })
   }
-  
   return res.status(202).json({ status: 'generating' })
 })
 
@@ -352,6 +397,6 @@ function cleanupSession(sessionId) {
 }
 
 app.listen(PORT, () => {
-  console.log(`🚀 VANGUARD MD Dual‑Mode Pairing Site (POLLING FIXED) LIVE → http://localhost:${PORT}`)
-  console.log(`👑 MD mode: /generate | MAX mode: /generate-max`)
+  console.log(`🚀 VANGUARD MD Pairing Site v10 LIVE → http://localhost:${PORT}`)
+  console.log(`👑 MD: /generate | MAX: /generate-max | QR: /generate-qr`)
 })
