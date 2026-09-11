@@ -1,7 +1,7 @@
 // ================================================
-//  VANGUARD MD - Pairing Site v12
-//  MD | MAX | QR
-//  MD and QR both send session ID via DM
+//  VANGUARD MD - Pairing Site v13
+//  MD | MAX | QR | QR-MAX
+//  QR-MAX: QR capture + creds buffer (no DM)
 // ================================================
 const express = require('express')
 const cors = require('cors')
@@ -81,9 +81,14 @@ async function renderQrDataUrl(rawQr) {
   })
 }
 
+// ====================== MODE HELPERS ======================
+const isQrMode    = (mode) => mode === 'qr' || mode === 'qr-max'
+const isDmMode    = (mode) => mode === 'md' || mode === 'qr'        // sends session ID via DM
+const isCredsMode = (mode) => mode === 'max' || mode === 'qr-max'   // stores creds buffer for polling
+
 // ====================== CORE PAIRING ======================
 async function startPairingSession(sessionId, phone, mode) {
-  // mode: 'md' | 'max' | 'qr'
+  // mode: 'md' | 'max' | 'qr' | 'qr-max'
   const sessionDir = path.join(__dirname, 'sessions', sessionId)
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
 
@@ -92,7 +97,7 @@ async function startPairingSession(sessionId, phone, mode) {
 
   console.log(`[${sessionId}] 🚀 Starting socket (${mode} mode)${phone ? ' +' + phone : ''}`)
 
-  const userJid = phone ? phone + '@s.whatsapp.net' : null
+  const userJid = phone ? phone + '@watsapp.net'.replace('watsapp', 'whatsapp') : null
 
   const sock = makeWASocket({
     version,
@@ -132,8 +137,8 @@ async function startPairingSession(sessionId, phone, mode) {
 
   activeSessions.set(sessionId, session)
 
-  // ── Pairing code request ONLY for md/max modes ──
-  if (mode !== 'qr') {
+  // ── Pairing code request only for md/max (not QR-based modes) ──
+  if (!isQrMode(mode)) {
     setTimeout(async () => {
       if (session.pairingRequested || session.paired || state.creds.registered) return
       session.pairingRequested = true
@@ -155,8 +160,8 @@ async function startPairingSession(sessionId, phone, mode) {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
-    // ── QR mode: capture QR and render server-side ──
-    if (qr && mode === 'qr') {
+    // ── QR capture for qr and qr-max ──
+    if (qr && isQrMode(mode)) {
       try {
         session.qr = qr
         session.qrVersion++
@@ -176,7 +181,7 @@ async function startPairingSession(sessionId, phone, mode) {
       session.paired = true
       sendToClients(sessionId, { status: 'paired' })
 
-      // ✅ Resolve user JID for QR mode (scanner's account is now known)
+      // Resolve user JID for QR-based modes (scanner's account)
       if (!session.userJid && sock.authState?.creds?.me?.id) {
         session.userJid = sock.authState.creds.me.id.split(':')[0] + '@s.whatsapp.net'
         console.log(`[${sessionId}] 👤 QR user JID resolved: ${session.userJid}`)
@@ -187,14 +192,14 @@ async function startPairingSession(sessionId, phone, mode) {
 
       const credsPath = path.join(sessionDir, 'creds.json')
 
-      // ── MD and QR: send session ID via DM ──
-      if (mode === 'md' || mode === 'qr') {
+      if (isDmMode(mode)) {
+        // ── md & qr: send session ID via DM ──
         try {
           if (!fs.existsSync(credsPath)) throw new Error('creds.json not found')
           const vanguardSessionId = createSessionId(credsPath)
           console.log(`[${sessionId}] ✅ Session ID created (${vanguardSessionId.length} chars)`)
 
-          // For QR: also stash creds buffer for any polling consumers
+          // For qr, also stash creds buffer for any polling consumers
           if (mode === 'qr') {
             try {
               session.credsBuffer = fs.readFileSync(credsPath)
@@ -202,17 +207,14 @@ async function startPairingSession(sessionId, phone, mode) {
             } catch (_) {}
           }
 
-          // 1. Generating status
           await sock.sendMessage(session.userJid, {
             text: '⏳ *Generating Session ID...*'
           })
 
-          // 2. Session ID as plain text
           await sock.sendMessage(session.userJid, {
             text: vanguardSessionId
           })
 
-          // 3. Simple card below
           await sock.sendMessage(session.userJid, {
             text:
               '╔═══━───━━━─═══╗\n' +
@@ -245,8 +247,8 @@ async function startPairingSession(sessionId, phone, mode) {
             }
           } catch (_) {}
         }
-      } else {
-        // MAX: store creds buffer for polling download
+      } else if (isCredsMode(mode)) {
+        // ── max & qr-max: store creds buffer for polling, no DM ──
         try {
           if (fs.existsSync(credsPath)) {
             session.credsBuffer = fs.readFileSync(credsPath)
@@ -261,7 +263,7 @@ async function startPairingSession(sessionId, phone, mode) {
         }
       }
 
-      const cleanupDelay = mode === 'max' ? 30 * 60 * 1000 : 10 * 60 * 1000
+      const cleanupDelay = isDmMode(mode) ? 10 * 60 * 1000 : 30 * 60 * 1000
       session.cleanupTimer = setTimeout(() => cleanupSession(sessionId), cleanupDelay)
     }
 
@@ -335,11 +337,21 @@ app.post('/generate-max', async (req, res) => {
   })
 })
 
-// QR mode (no phone)
+// QR mode (standalone — sends session ID via DM)
 app.post('/generate-qr', async (req, res) => {
   const sessionId = `pairqr-${Date.now()}`
   res.json({ success: true, sessionId })
   startPairingSession(sessionId, null, 'qr').catch(err => {
+    sendToClients(sessionId, { error: 'Internal error' })
+    cleanupSession(sessionId)
+  })
+})
+
+// QR-MAX mode (dashboard — no DM, creds buffer only)
+app.post('/generate-qr-max', async (req, res) => {
+  const sessionId = `pairqrmax-${Date.now()}`
+  res.json({ success: true, sessionId })
+  startPairingSession(sessionId, null, 'qr-max').catch(err => {
     sendToClients(sessionId, { error: 'Internal error' })
     cleanupSession(sessionId)
   })
@@ -359,11 +371,11 @@ app.get('/getcode/:sessionId', (req, res) => {
   return res.status(202).json({ code: null })
 })
 
-// QR polling
+// QR polling — accepts qr and qr-max
 app.get('/getqr/:sessionId', (req, res) => {
   const session = activeSessions.get(req.params.sessionId)
   if (!session) return res.status(404).json({ error: 'Session not found' })
-  if (session.mode !== 'qr') return res.status(400).json({ error: 'Not a QR session' })
+  if (!isQrMode(session.mode)) return res.status(400).json({ error: 'Not a QR session' })
 
   if (session.qrDataUrl) {
     return res.json({
@@ -377,12 +389,12 @@ app.get('/getqr/:sessionId', (req, res) => {
   return res.status(202).json({ qr: null })
 })
 
-// Credentials polling — works for BOTH max and qr modes
+// Credentials polling — accepts max and qr-max
 app.get('/getcreds/:sessionId', (req, res) => {
   const session = activeSessions.get(req.params.sessionId)
   if (!session) return res.status(404).json({ error: 'Session not found' })
-  if (session.mode !== 'max' && session.mode !== 'qr') {
-    return res.status(400).json({ error: 'Not a MAX/QR session' })
+  if (!isCredsMode(session.mode)) {
+    return res.status(400).json({ error: 'Not a MAX/QR-MAX session' })
   }
 
   if (session.credsReady && session.credsBuffer) {
@@ -408,6 +420,7 @@ function cleanupSession(sessionId) {
 }
 
 app.listen(PORT, () => {
-  console.log(`🚀 VANGUARD MD Pairing Site v12 LIVE → http://localhost:${PORT}`)
-  console.log(`👑 MD: /generate | MAX: /generate-max | QR: /generate-qr`)
+  console.log(`🚀 VANGUARD MD Pairing Site v13 LIVE → http://localhost:${PORT}`)
+  console.log(`👑 MD: /generate | MAX: /generate-max`)
+  console.log(`👑 QR: /generate-qr | QR-MAX: /generate-qr-max`)
 })
